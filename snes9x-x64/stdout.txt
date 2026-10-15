@@ -1,0 +1,3 @@
+Reading config file C:\Users\eli\Downloads\snes9x-x64\snes9x.conf.
+Saving	config file	C:\Users\eli\Downloads\snes9x-x64\snes9x.conf
+Saving	config file	C:\Users\eli\Downloads\snes9x-x64\snes9x.conf
