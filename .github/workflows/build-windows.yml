@@ -1,0 +1,49 @@
+# Builds Snes9x 1.60 for Windows (x64) with the controller profile patch applied.
+# Run it from the repository's "Actions" tab (Build Snes9x -> Run workflow), then download
+# the "snes9x-x64" artifact from the finished run. Nothing needs to be installed locally.
+#
+# NOTE: written without being able to run it. The project file asks for the old v141_xp toolset;
+# this overrides it with the one the GitHub runner has (v143). If the build step fails, the log
+# says which line of Snes9x did not compile with the newer compiler.
+name: Build Snes9x
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main, master ]
+
+jobs:
+  build:
+    runs-on: windows-2022
+    steps:
+      # keep line endings as they are, or the patch will not match
+      - name: Disable line-ending conversion
+        run: git config --global core.autocrlf false
+
+      - name: Check out this repository (it holds the patch)
+        uses: actions/checkout@v4
+        with:
+          path: patch
+
+      - name: Get Snes9x 1.60 with its bundled libraries
+        shell: bash
+        run: git clone --branch 1.60 --recurse-submodules https://github.com/snes9xgit/snes9x.git snes9x
+
+      - name: Apply the controller profile patch
+        shell: bash
+        working-directory: snes9x
+        run: git apply --whitespace=nowarn ../patch/controller-profiles.patch
+
+      - name: Set up MSBuild
+        uses: microsoft/setup-msbuild@v2
+
+      - name: Build (Release Unicode, x64)
+        working-directory: snes9x
+        run: msbuild win32\snes9xw.sln /t:build /m /p:Configuration="Release Unicode" /p:Platform=x64 /p:PlatformToolset=v143 /p:WindowsTargetPlatformVersion=10.0
+
+      - name: Upload the executable
+        uses: actions/upload-artifact@v4
+        with:
+          name: snes9x-x64
+          path: snes9x/win32/snes9x-x64.exe
+          if-no-files-found: error

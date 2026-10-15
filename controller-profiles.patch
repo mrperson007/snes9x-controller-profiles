@@ -1,0 +1,2095 @@
+diff --git a/win32/InputProfiles.cpp b/win32/InputProfiles.cpp
+new file mode 100644
+index 0000000..e86c306
+--- /dev/null
++++ b/win32/InputProfiles.cpp
+@@ -0,0 +1,708 @@
++/*****************************************************************************\
++     Snes9x - Portable Super Nintendo Entertainment System (TM) emulator.
++                This file is licensed under the Snes9x License.
++   For further information, consult the LICENSE file in the root directory.
++\*****************************************************************************/
++
++// Controller profiles, controller selection and auto-configure: the Windows side.
++// See InputProfiles.h. The decisions (what to bind, how files look, which controller
++// a key refers to) are made in InputProfilesCore.cpp, which has unit tests.
++
++#include "../port.h"
++#include "../snes9x.h"
++#include "../display.h"
++#include "wsnes9x.h"
++#include "wlanguage.h"
++#include "InputProfiles.h"
++
++#include <algorithm>
++#include <string>
++#include <vector>
++#include <stdarg.h>
++#include <stdio.h>
++#include <string.h>
++
++#pragma comment(lib, "advapi32.lib")
++
++namespace ip = inprof;
++typedef std::basic_string<TCHAR> tstring;
++
++TCHAR JoypadDeviceKey[NUM_PROFILE_PADS][JOYPAD_DEVICE_KEY_LEN];
++
++extern SJoyState JoystickF[16];            // wsnes9x.cpp: the Input dialog's own copy of the controller state
++extern struct SJoypad DefaultJoypad[16];   // wsnes9x.cpp: the factory keyboard layout
++void S9xDetectJoypads();                   // win32.cpp
++
++static const TCHAR* const kProfileExt = TEXT(".s9xpad");
++
++/*---------------------------------------------------------------------------*/
++// text helpers: Snes9x keeps TCHAR strings, the core and the profile files use UTF-8
++
++static std::string T2U(const TCHAR* s)
++{
++#ifdef UNICODE
++	int n = WideCharToMultiByte(CP_UTF8, 0, s, -1, NULL, 0, NULL, NULL);
++	if (n <= 1) return std::string();
++	std::string r((size_t)n - 1, '\0');
++	WideCharToMultiByte(CP_UTF8, 0, s, -1, &r[0], n, NULL, NULL);
++	return r;
++#else
++	return std::string(s);
++#endif
++}
++
++static tstring U2T(const std::string& s)
++{
++#ifdef UNICODE
++	if (s.empty()) return tstring();
++	int n = MultiByteToWideChar(CP_UTF8, 0, s.c_str(), -1, NULL, 0);
++	if (n <= 1) return tstring();
++	tstring r((size_t)n - 1, L'\0');
++	MultiByteToWideChar(CP_UTF8, 0, s.c_str(), -1, &r[0], n);
++	return r;
++#else
++	return tstring(s.begin(), s.end());
++#endif
++}
++
++static tstring Format(const TCHAR* fmt, ...)
++{
++	TCHAR buf[512];
++	va_list ap;
++	va_start(ap, fmt);
++	_vsntprintf(buf, COUNT(buf) - 1, fmt, ap);
++	va_end(ap);
++	buf[COUNT(buf) - 1] = TEXT('\0');
++	return buf;
++}
++
++/*---------------------------------------------------------------------------*/
++// game controllers
++
++// "VID_045E&PID_028E" style registry key names carry the real vendor / product ids.
++static bool ParseHexAfter(const tstring& upper, const TCHAR* tag, unsigned& out)
++{
++	size_t p = upper.find(tag);
++	if (p == tstring::npos) return false;
++	p += _tcslen(tag);
++
++	unsigned v = 0;
++	int digits = 0;
++	while (p < upper.size() && digits < 4)
++	{
++		TCHAR c = upper[p];
++		unsigned d;
++		if (c >= TEXT('0') && c <= TEXT('9'))      d = c - TEXT('0');
++		else if (c >= TEXT('A') && c <= TEXT('F')) d = c - TEXT('A') + 10;
++		else break;
++		v = v * 16 + d;
++		digits++;
++		p++;
++	}
++	if (digits != 4) return false;
++	out = v;
++	return true;
++}
++
++// The friendly name Windows shows in "Set up USB game controllers" lives in the registry,
++// keyed by the joystick's registry key name. The name in JOYCAPS is often a generic
++// "Microsoft PC-joystick driver".
++static tstring ReadOemName(const TCHAR* regKeyName)
++{
++	if (!regKeyName || !*regKeyName) return tstring();
++
++	tstring path = TEXT("System\\CurrentControlSet\\Control\\MediaProperties\\PrivateProperties\\Joystick\\OEM\\");
++	path += regKeyName;
++
++	const HKEY roots[2] = { HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE };
++	for (int r = 0; r < 2; r++)
++	{
++		HKEY hk = NULL;
++		if (RegOpenKeyEx(roots[r], path.c_str(), 0, KEY_READ, &hk) != ERROR_SUCCESS)
++			continue;
++
++		TCHAR buf[256];
++		DWORD type = 0, size = (DWORD)(sizeof(buf) - sizeof(TCHAR));   // leave room for a terminator
++		LONG rc = RegQueryValueEx(hk, TEXT("OEMName"), NULL, &type, (LPBYTE)buf, &size);
++		RegCloseKey(hk);
++
++		if (rc == ERROR_SUCCESS && type == REG_SZ)
++		{
++			buf[size / sizeof(TCHAR)] = TEXT('\0');
++			if (buf[0]) return buf;
++		}
++	}
++	return tstring();
++}
++
++std::vector<ip::DeviceInfo> InputProfiles_EnumerateDevices()
++{
++	std::vector<ip::DeviceInfo> list;
++
++	for (int i = 0; i < ip::MAX_JOYSTICKS; i++)
++	{
++		JOYCAPS caps;
++		if (joyGetDevCaps(JOYSTICKID1 + i, &caps, sizeof(caps)) != JOYERR_NOERROR)
++			continue;
++
++		// joyGetDevCaps also succeeds for controllers that were once installed but are
++		// unplugged; only list the ones that answer.
++		JOYINFOEX state;
++		state.dwSize = sizeof(state);
++		state.dwFlags = JOY_RETURNALL;
++		if (joyGetPosEx(JOYSTICKID1 + i, &state) != JOYERR_NOERROR)
++			continue;
++
++		ip::DeviceInfo d;
++		d.index = i;
++
++		tstring name = ReadOemName(caps.szRegKey);
++		if (name.empty()) name = caps.szPname;
++		d.name = T2U(name.c_str());
++
++		unsigned vid = caps.wMid, pid = caps.wPid;
++		tstring regKey = caps.szRegKey;
++		for (size_t k = 0; k < regKey.size(); k++)
++			if (regKey[k] >= TEXT('a') && regKey[k] <= TEXT('z')) regKey[k] = (TCHAR)(regKey[k] - TEXT('a') + TEXT('A'));
++		unsigned v2, p2;
++		if (ParseHexAfter(regKey, TEXT("VID_"), v2) && ParseHexAfter(regKey, TEXT("PID_"), p2))
++		{
++			vid = v2;
++			pid = p2;
++		}
++		d.vendorId = (uint16_t)vid;
++		d.productId = (uint16_t)pid;
++
++		d.numButtons = (int)caps.wNumButtons;
++		d.numAxes = (int)caps.wNumAxes;
++		d.hasPov = (caps.wCaps & JOYCAPS_HASPOV) != 0;
++		list.push_back(d);
++	}
++
++	ip::AssignDeviceKeys(list);
++	return list;
++}
++
++/*---------------------------------------------------------------------------*/
++// Joypad[] <-> Bindings
++
++static void ReadPad(int pad, ip::Bindings& b)        { ip::ReadBindings(Joypad[pad], Joypad[pad + 8], b); }
++static void WritePad(int pad, const ip::Bindings& b) { ip::WriteBindings(b, Joypad[pad], Joypad[pad + 8]); }
++
++/*---------------------------------------------------------------------------*/
++// remembering which controller a joypad belongs to
++
++void InputProfiles_RememberDevices()
++{
++	std::vector<ip::DeviceInfo> devices = InputProfiles_EnumerateDevices();
++
++	for (int pad = 0; pad < NUM_PROFILE_PADS; pad++)
++	{
++		ip::Bindings b;
++		ReadPad(pad, b);
++		int joy = ip::PrimaryJoyIndex(b);
++
++		// keyboard-only joypads forget their controller. A controller that is not plugged
++		// in right now keeps whatever was remembered before.
++		if (joy < 0)
++		{
++			JoypadDeviceKey[pad][0] = TEXT('\0');
++			continue;
++		}
++		for (size_t i = 0; i < devices.size(); i++)
++		{
++			if (devices[i].index == joy)
++			{
++				tstring key = U2T(devices[i].key);
++				lstrcpyn(JoypadDeviceKey[pad], key.c_str(), JOYPAD_DEVICE_KEY_LEN);
++				break;
++			}
++		}
++	}
++}
++
++void InputProfiles_ResolveDevices()
++{
++	std::vector<ip::DeviceInfo> devices = InputProfiles_EnumerateDevices();
++	if (devices.empty()) return;
++
++	for (int pad = 0; pad < NUM_PROFILE_PADS; pad++)
++	{
++		std::string key = T2U(JoypadDeviceKey[pad]);
++		if (key.empty()) continue;
++
++		// exact match only: a missing second controller must not send both players to the first one
++		int pos = ip::FindDeviceByKey(devices, key, false);
++		if (pos < 0) continue;
++
++		ip::Bindings b;
++		ReadPad(pad, b);
++		int from = ip::PrimaryJoyIndex(b);
++		if (from < 0) continue;
++
++		if (ip::RetargetJoystick(b, from, devices[pos].index) > 0)
++			WritePad(pad, b);
++	}
++}
++
++/*---------------------------------------------------------------------------*/
++// profile files: <folder of snes9x.exe>\InputProfiles\<name>.s9xpad
++
++static tstring ProfileDir()
++{
++	tstring dir = S9xGetDirectoryT(DEFAULT_DIR);
++	if (!dir.empty() && dir[dir.size() - 1] != TEXT('\\'))
++		dir += TEXT('\\');
++	dir += TEXT("InputProfiles");
++	return dir;
++}
++
++static tstring ProfilePath(const std::string& name)
++{
++	return ProfileDir() + TEXT("\\") + U2T(name) + kProfileExt;
++}
++
++static bool ProfileExists(const std::string& name)
++{
++	DWORD attr = GetFileAttributes(ProfilePath(name).c_str());
++	return attr != INVALID_FILE_ATTRIBUTES && (attr & FILE_ATTRIBUTE_DIRECTORY) == 0;
++}
++
++static bool ReadWholeFile(const tstring& path, std::string& out)
++{
++	HANDLE h = CreateFile(path.c_str(), GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
++	if (h == INVALID_HANDLE_VALUE) return false;
++
++	bool ok = false;
++	DWORD size = GetFileSize(h, NULL);
++	if (size != INVALID_FILE_SIZE && size <= 65536)         // a profile is about 1 KB
++	{
++		out.assign(size, '\0');
++		DWORD got = 0;
++		ok = (size == 0) || (ReadFile(h, &out[0], size, &got, NULL) && got == size);
++	}
++	CloseHandle(h);
++	return ok;
++}
++
++// written next to the target first, so a crash cannot leave half a profile behind
++static bool WriteWholeFile(const tstring& path, const std::string& data)
++{
++	tstring tmp = path + TEXT(".tmp");
++	HANDLE h = CreateFile(tmp.c_str(), GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
++	if (h == INVALID_HANDLE_VALUE) return false;
++
++	DWORD put = 0;
++	bool ok = WriteFile(h, data.data(), (DWORD)data.size(), &put, NULL) && put == (DWORD)data.size();
++	CloseHandle(h);
++
++	if (ok) ok = MoveFileEx(tmp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING) != 0;
++	if (!ok) DeleteFile(tmp.c_str());
++	return ok;
++}
++
++enum ProfileLoadResult { PL_OK, PL_MISSING, PL_BAD };
++
++static ProfileLoadResult LoadProfileFile(const std::string& name, ip::Profile& out)
++{
++	std::string text;
++	if (!ReadWholeFile(ProfilePath(name), text)) return PL_MISSING;
++	return ip::ParseProfile(text, out) ? PL_OK : PL_BAD;
++}
++
++static bool SaveProfileFile(const ip::Profile& p)
++{
++	tstring dir = ProfileDir();
++	if (!CreateDirectory(dir.c_str(), NULL) && GetLastError() != ERROR_ALREADY_EXISTS)
++		return false;
++	return WriteWholeFile(ProfilePath(p.name), ip::SerializeProfile(p));
++}
++
++static bool DeleteProfileFile(const std::string& name)
++{
++	return DeleteFile(ProfilePath(name).c_str()) != 0;
++}
++
++static bool NameLess(const tstring& a, const tstring& b)
++{
++	return lstrcmpi(a.c_str(), b.c_str()) < 0;
++}
++
++static std::vector<tstring> ListProfiles()
++{
++	std::vector<tstring> names;
++
++	WIN32_FIND_DATA fd;
++	HANDLE h = FindFirstFile((ProfileDir() + TEXT("\\*") + kProfileExt).c_str(), &fd);
++	if (h == INVALID_HANDLE_VALUE) return names;
++
++	const tstring ext = kProfileExt;
++	do
++	{
++		if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
++		tstring n = fd.cFileName;
++		if (n.size() > ext.size() && lstrcmpi(n.c_str() + n.size() - ext.size(), ext.c_str()) == 0)
++			names.push_back(n.substr(0, n.size() - ext.size()));
++	} while (FindNextFile(h, &fd));
++	FindClose(h);
++
++	std::sort(names.begin(), names.end(), NameLess);
++	return names;
++}
++
++/*---------------------------------------------------------------------------*/
++// Input Configuration dialog
++
++static std::vector<ip::DeviceInfo> g_devices;   // what the Device list shows (list item n+1 = g_devices[n])
++
++static void SetStatus(HWND hDlg, const tstring& text)
++{
++	SetDlgItemText(hDlg, IDC_PROFILE_STATUS, text.c_str());
++}
++
++static void FillDeviceCombo(HWND hDlg)
++{
++	SendDlgItemMessage(hDlg, IDC_DEVCOMBO, CB_RESETCONTENT, 0, 0);
++	SendDlgItemMessage(hDlg, IDC_DEVCOMBO, CB_ADDSTRING, 0, (LPARAM)INPUTCONFIG_DEVICE_KEYBOARD);
++	for (size_t i = 0; i < g_devices.size(); i++)
++	{
++		tstring item = Format(INPUTCONFIG_DEVICE_ITEM, g_devices[i].index + 1, U2T(g_devices[i].name).c_str());
++		SendDlgItemMessage(hDlg, IDC_DEVCOMBO, CB_ADDSTRING, 0, (LPARAM)item.c_str());
++	}
++	SendDlgItemMessage(hDlg, IDC_DEVCOMBO, CB_SETCURSEL, 0, 0);
++}
++
++// Position in g_devices of the chosen controller, or -1 for "Keyboard / as saved".
++static int SelectedDevicePos(HWND hDlg)
++{
++	int sel = (int)SendDlgItemMessage(hDlg, IDC_DEVCOMBO, CB_GETCURSEL, 0, 0);
++	if (sel <= 0 || sel > (int)g_devices.size()) return -1;
++	return sel - 1;
++}
++
++static void SelectDevicePos(HWND hDlg, int pos)
++{
++	SendDlgItemMessage(hDlg, IDC_DEVCOMBO, CB_SETCURSEL, (WPARAM)(pos + 1), 0);
++}
++
++// Show the controller this joypad's bindings currently point at.
++static void PreselectDeviceForPad(HWND hDlg, int pad)
++{
++	ip::Bindings b;
++	ReadPad(pad, b);
++	int joy = ip::PrimaryJoyIndex(b);
++
++	int pos = -1;
++	for (size_t i = 0; i < g_devices.size(); i++)
++		if (g_devices[i].index == joy) pos = (int)i;
++	SelectDevicePos(hDlg, pos);
++}
++
++static std::string TypedProfileName(HWND hDlg)
++{
++	TCHAR buf[256] = { 0 };
++	GetDlgItemText(hDlg, IDC_PROFILECOMBO, buf, COUNT(buf));
++	return ip::SanitizeProfileName(T2U(buf));
++}
++
++// Reloads the list of saved profiles. The text box keeps what was typed unless a name is given.
++static void RefillProfiles(HWND hDlg, const std::string* showName)
++{
++	TCHAR typed[256] = { 0 };
++	GetDlgItemText(hDlg, IDC_PROFILECOMBO, typed, COUNT(typed));
++
++	SendDlgItemMessage(hDlg, IDC_PROFILECOMBO, CB_RESETCONTENT, 0, 0);
++	std::vector<tstring> names = ListProfiles();
++	for (size_t i = 0; i < names.size(); i++)
++		SendDlgItemMessage(hDlg, IDC_PROFILECOMBO, CB_ADDSTRING, 0, (LPARAM)names[i].c_str());
++
++	if (showName) SetDlgItemText(hDlg, IDC_PROFILECOMBO, U2T(*showName).c_str());
++	else          SetDlgItemText(hDlg, IDC_PROFILECOMBO, typed);
++}
++
++// Turns a joypad on when it has just been given buttons, and refreshes the "Enabled" box.
++static void EnablePadIfNeeded(HWND hDlg, int pad, const ip::Bindings& b)
++{
++	bool any = false;
++	for (int i = 0; i < ip::NUM_PAD_SLOTS; i++)
++		if (b.v[i] != 0) any = true;
++	if (any && !Joypad[pad].Enabled)
++		Joypad[pad].Enabled = TRUE;
++
++	CheckDlgButton(hDlg, IDC_JPTOGGLE, Joypad[pad].Enabled ? BST_CHECKED : BST_UNCHECKED);
++}
++
++static void RefreshDevices(HWND hDlg, int pad)
++{
++	std::string keep;
++	int pos = SelectedDevicePos(hDlg);
++	if (pos >= 0) keep = g_devices[pos].key;
++
++	// let the emulator itself notice new / removed controllers, and give the dialog's
++	// button / axis capture the ranges of newly plugged in ones
++	S9xDetectJoypads();
++	for (short C = 0; C != 16; C++)
++		JoystickF[C].Attached = joyGetDevCaps(JOYSTICKID1 + C, &JoystickF[C].Caps, sizeof(JOYCAPS)) == JOYERR_NOERROR;
++
++	g_devices = InputProfiles_EnumerateDevices();
++	FillDeviceCombo(hDlg);
++
++	int again = keep.empty() ? -1 : ip::FindDeviceByKey(g_devices, keep, false);
++	if (again >= 0) SelectDevicePos(hDlg, again);
++	else            PreselectDeviceForPad(hDlg, pad);
++
++	SetStatus(hDlg, Format(INPUTCONFIG_MSG_DEVICES_FOUND, (int)g_devices.size()));
++}
++
++static bool DoAutoConfigure(HWND hDlg, int pad)
++{
++	ip::Bindings b;
++	ReadPad(pad, b);
++
++	int pos = SelectedDevicePos(hDlg);
++	if (pos < 0)
++	{
++		// "Keyboard": put back the factory keys. Only joypads 1 and 2 have any.
++		ip::Bindings defaults;
++		ip::ReadBindings(DefaultJoypad[pad], DefaultJoypad[pad + 8], defaults);
++		bool any = false;
++		for (int i = 0; i < ip::NUM_PAD_SLOTS; i++)
++			if (defaults.v[i] != 0) any = true;
++		if (!any)
++		{
++			SetStatus(hDlg, Format(INPUTCONFIG_MSG_NO_KEYBOARD_DEFAULT, pad + 1));
++			return false;
++		}
++		for (int i = 0; i < ip::NUM_PAD_SLOTS; i++)      // the Turbo panel keeps its keys
++			b.v[i] = defaults.v[i];
++		WritePad(pad, b);
++		EnablePadIfNeeded(hDlg, pad, b);
++		SetStatus(hDlg, Format(INPUTCONFIG_MSG_KEYBOARD_RESET, pad + 1));
++		return true;
++	}
++
++	const ip::DeviceInfo& dev = g_devices[pos];
++	tstring devName = U2T(dev.name);
++	if (!ip::AutoConfigure(dev, b))
++	{
++		SetStatus(hDlg, Format(INPUTCONFIG_MSG_AUTOCONFIG_UNUSABLE, devName.c_str()));
++		return false;
++	}
++	WritePad(pad, b);
++	EnablePadIfNeeded(hDlg, pad, b);
++	SetStatus(hDlg, Format(INPUTCONFIG_MSG_AUTOCONFIG_DONE, pad + 1, devName.c_str(),
++	                       U2T(ip::LayoutName(ip::DetectLayout(dev))).c_str()));
++	return true;
++}
++
++static bool DoLoadProfile(HWND hDlg, int pad)
++{
++	std::string name = TypedProfileName(hDlg);
++	if (name.empty())
++	{
++		SetStatus(hDlg, INPUTCONFIG_MSG_NEED_NAME);
++		return false;
++	}
++
++	ip::Profile prof;
++	switch (LoadProfileFile(name, prof))
++	{
++		case PL_MISSING: SetStatus(hDlg, Format(INPUTCONFIG_MSG_NO_SUCH_PROFILE, U2T(name).c_str())); return false;
++		case PL_BAD:     SetStatus(hDlg, Format(INPUTCONFIG_MSG_BAD_PROFILE, U2T(name).c_str())); return false;
++		default: break;
++	}
++
++	ip::Bindings b = prof.bindings;
++	const int from = ip::PrimaryJoyIndex(b);
++
++	// Which controller gets the profile's buttons: the one chosen in the Device list. If that
++	// says "Keyboard / as saved", use the controller the profile was made for when it is plugged
++	// in, and otherwise keep the joystick numbers stored in the profile.
++	int pos = SelectedDevicePos(hDlg);
++	bool controllerMissing = false;
++	if (pos < 0 && from >= 0 && !prof.deviceKey.empty())
++	{
++		pos = ip::FindDeviceByKey(g_devices, prof.deviceKey, true);
++		if (pos >= 0) SelectDevicePos(hDlg, pos);
++		else          controllerMissing = true;
++	}
++	if (pos >= 0 && from >= 0)
++		ip::RetargetJoystick(b, from, g_devices[pos].index);
++
++	WritePad(pad, b);
++	EnablePadIfNeeded(hDlg, pad, b);
++
++	if (controllerMissing)
++		SetStatus(hDlg, Format(INPUTCONFIG_MSG_PROFILE_LOADED_NO_DEVICE, U2T(name).c_str(), pad + 1,
++		                       U2T(prof.deviceName.empty() ? prof.deviceKey : prof.deviceName).c_str()));
++	else
++		SetStatus(hDlg, Format(INPUTCONFIG_MSG_PROFILE_LOADED, U2T(name).c_str(), pad + 1));
++	return true;
++}
++
++static void DoSaveProfile(HWND hDlg, int pad)
++{
++	std::string name = TypedProfileName(hDlg);
++	if (name.empty())
++	{
++		SetStatus(hDlg, INPUTCONFIG_MSG_NEED_NAME);
++		return;
++	}
++
++	if (ProfileExists(name))
++	{
++		tstring ask = Format(INPUTCONFIG_MSG_CONFIRM_OVERWRITE, U2T(name).c_str());
++		if (MessageBox(hDlg, ask.c_str(), INPUTCONFIG_TITLE, MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2) != IDYES)
++			return;
++	}
++
++	ip::Profile prof;
++	prof.name = name;
++	ReadPad(pad, prof.bindings);
++
++	// note which controller the joystick bindings are for (none for a keyboard-only joypad)
++	int joy = ip::PrimaryJoyIndex(prof.bindings);
++	for (size_t i = 0; joy >= 0 && i < g_devices.size(); i++)
++	{
++		if (g_devices[i].index == joy)
++		{
++			prof.deviceKey = g_devices[i].key;
++			prof.deviceName = g_devices[i].name;
++		}
++	}
++
++	if (!SaveProfileFile(prof))
++	{
++		tstring msg = Format(INPUTCONFIG_MSG_SAVE_FAILED, U2T(name).c_str());
++		MessageBox(hDlg, msg.c_str(), INPUTCONFIG_TITLE, MB_OK | MB_ICONERROR);
++		return;
++	}
++
++	RefillProfiles(hDlg, &name);
++	SetStatus(hDlg, Format(INPUTCONFIG_MSG_PROFILE_SAVED, U2T(name).c_str()));
++}
++
++static void DoDeleteProfile(HWND hDlg)
++{
++	std::string name = TypedProfileName(hDlg);
++	if (name.empty())
++	{
++		SetStatus(hDlg, INPUTCONFIG_MSG_NEED_NAME);
++		return;
++	}
++	if (!ProfileExists(name))
++	{
++		SetStatus(hDlg, Format(INPUTCONFIG_MSG_NO_SUCH_PROFILE, U2T(name).c_str()));
++		return;
++	}
++
++	tstring ask = Format(INPUTCONFIG_MSG_CONFIRM_DELETE, U2T(name).c_str());
++	if (MessageBox(hDlg, ask.c_str(), INPUTCONFIG_TITLE, MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2) != IDYES)
++		return;
++
++	if (!DeleteProfileFile(name))
++	{
++		tstring msg = Format(INPUTCONFIG_MSG_DELETE_FAILED, U2T(name).c_str());
++		MessageBox(hDlg, msg.c_str(), INPUTCONFIG_TITLE, MB_OK | MB_ICONERROR);
++		return;
++	}
++
++	std::string none;
++	RefillProfiles(hDlg, &none);
++	SetStatus(hDlg, Format(INPUTCONFIG_MSG_PROFILE_DELETED, U2T(name).c_str()));
++}
++
++// The user picked a name from the Profile list: show which controller it was made for.
++static void OnProfilePicked(HWND hDlg)
++{
++	int sel = (int)SendDlgItemMessage(hDlg, IDC_PROFILECOMBO, CB_GETCURSEL, 0, 0);
++	if (sel < 0) return;
++	int len = (int)SendDlgItemMessage(hDlg, IDC_PROFILECOMBO, CB_GETLBTEXTLEN, (WPARAM)sel, 0);
++	if (len <= 0) return;
++
++	std::vector<TCHAR> text((size_t)len + 1, TEXT('\0'));
++	SendDlgItemMessage(hDlg, IDC_PROFILECOMBO, CB_GETLBTEXT, (WPARAM)sel, (LPARAM)&text[0]);
++
++	ip::Profile prof;
++	if (LoadProfileFile(ip::SanitizeProfileName(T2U(&text[0])), prof) != PL_OK) return;
++
++	if (!prof.deviceKey.empty())
++	{
++		int pos = ip::FindDeviceByKey(g_devices, prof.deviceKey, true);
++		if (pos >= 0) SelectDevicePos(hDlg, pos);
++	}
++}
++
++/*---------------------------------------------------------------------------*/
++
++void InputProfilesDlg_Init(HWND hDlg, int padSlot, bool turboView)
++{
++	SetDlgItemText(hDlg, IDC_GROUP_PROFILES, INPUTCONFIG_GROUP_PROFILES);
++	SetDlgItemText(hDlg, IDC_LABEL_DEVICE, INPUTCONFIG_LABEL_DEVICE);
++	SetDlgItemText(hDlg, IDC_LABEL_PROFILE, INPUTCONFIG_LABEL_PROFILE);
++	SetDlgItemText(hDlg, IDC_DEV_REFRESH, INPUTCONFIG_BUTTON_REFRESH);
++	SetDlgItemText(hDlg, IDC_AUTOCONFIG, INPUTCONFIG_BUTTON_AUTOCONFIG);
++	SetDlgItemText(hDlg, IDC_PROFILE_LOAD, INPUTCONFIG_BUTTON_LOAD);
++	SetDlgItemText(hDlg, IDC_PROFILE_SAVE, INPUTCONFIG_BUTTON_SAVE);
++	SetDlgItemText(hDlg, IDC_PROFILE_DELETE, INPUTCONFIG_BUTTON_DELETE);
++	SetDlgItemText(hDlg, IDC_PROFILE_STATUS, TEXT(""));
++
++	g_devices = InputProfiles_EnumerateDevices();
++	FillDeviceCombo(hDlg);
++	RefillProfiles(hDlg, NULL);
++
++	InputProfilesDlg_OnSlotChanged(hDlg, padSlot, turboView);
++}
++
++void InputProfilesDlg_OnSlotChanged(HWND hDlg, int padSlot, bool turboView)
++{
++	PreselectDeviceForPad(hDlg, padSlot);
++
++	// Auto-Configure only fills in the pad itself, so it would look like it did nothing
++	// while the Turbo panel is on screen.
++	EnableWindow(GetDlgItem(hDlg, IDC_AUTOCONFIG), turboView ? FALSE : TRUE);
++}
++
++int InputProfilesDlg_OnCommand(HWND hDlg, int controlId, int notifyCode, int padSlot)
++{
++	switch (controlId)
++	{
++		case IDC_DEVCOMBO:
++			return IPD_HANDLED;                      // read when Auto-Configure / Load is pressed
++
++		case IDC_DEV_REFRESH:
++			if (notifyCode == BN_CLICKED) RefreshDevices(hDlg, padSlot);
++			return IPD_HANDLED;
++
++		case IDC_AUTOCONFIG:
++			if (notifyCode == BN_CLICKED && DoAutoConfigure(hDlg, padSlot)) return IPD_BINDINGS_CHANGED;
++			return IPD_HANDLED;
++
++		case IDC_PROFILECOMBO:
++			if (notifyCode == CBN_SELCHANGE) OnProfilePicked(hDlg);
++			return IPD_HANDLED;
++
++		case IDC_PROFILE_LOAD:
++			if (notifyCode == BN_CLICKED && DoLoadProfile(hDlg, padSlot)) return IPD_BINDINGS_CHANGED;
++			return IPD_HANDLED;
++
++		case IDC_PROFILE_SAVE:
++			if (notifyCode == BN_CLICKED) DoSaveProfile(hDlg, padSlot);
++			return IPD_HANDLED;
++
++		case IDC_PROFILE_DELETE:
++			if (notifyCode == BN_CLICKED) DoDeleteProfile(hDlg);
++			return IPD_HANDLED;
++
++		case IDOK:
++		{
++			// Enter while typing a profile name must not close the whole dialog
++			HWND focus = GetFocus();
++			HWND combo = GetDlgItem(hDlg, IDC_PROFILECOMBO);
++			if (focus && combo && (focus == combo || GetParent(focus) == combo))
++				return IPD_HANDLED;
++			return IPD_NOT_HANDLED;
++		}
++	}
++	return IPD_NOT_HANDLED;
++}
+diff --git a/win32/InputProfiles.h b/win32/InputProfiles.h
+new file mode 100644
+index 0000000..e232ab9
+--- /dev/null
++++ b/win32/InputProfiles.h
+@@ -0,0 +1,50 @@
++/*****************************************************************************\
++     Snes9x - Portable Super Nintendo Entertainment System (TM) emulator.
++                This file is licensed under the Snes9x License.
++   For further information, consult the LICENSE file in the root directory.
++\*****************************************************************************/
++
++// Controller profiles, controller selection and auto-configure: the Windows side.
++// The logic lives in InputProfilesCore.*; this file talks to winmm (game controllers),
++// the file system (profile files) and the Input Configuration dialog.
++
++#ifndef S9X_INPUTPROFILES_H_INCLUDED
++#define S9X_INPUTPROFILES_H_INCLUDED
++
++#include <windows.h>
++#include <tchar.h>
++#include <vector>
++#include "InputProfilesCore.h"
++
++#define NUM_PROFILE_PADS        5      // joypads 1-5 are the ones the Input dialog can configure
++#define JOYPAD_DEVICE_KEY_LEN   96     // room for any inprof::DeviceInfo::key
++
++// Which physical controller each joypad was last set up for, as inprof::DeviceInfo::key.
++// Stored in snes9x.conf (Joypad1:Device ...) so the bindings can follow the controller
++// when Windows numbers the game controllers differently from one run to the next.
++extern TCHAR JoypadDeviceKey[NUM_PROFILE_PADS][JOYPAD_DEVICE_KEY_LEN];
++
++// Game controllers that are plugged in right now.
++std::vector<inprof::DeviceInfo> InputProfiles_EnumerateDevices();
++
++// Called at startup and after "Detect Gamepad Changes": if a joypad's controller is now
++// listed under a different joystick number, moves that joypad's bindings along with it.
++void InputProfiles_ResolveDevices();
++
++// Called when the Input dialog is accepted: notes which controller each joypad uses.
++void InputProfiles_RememberDevices();
++
++// ---- Input Configuration dialog ----
++enum
++{
++	IPD_NOT_HANDLED     = 0,   // not one of ours, the dialog should deal with it
++	IPD_HANDLED         = 1,
++	IPD_BINDINGS_CHANGED= 2    // handled, and Joypad[] changed: the dialog must redraw its fields
++};
++
++// padSlot is 0..4 (joypad 1-5); turboView is true while the "Turbo" panel is displayed.
++void InputProfilesDlg_Init(HWND hDlg, int padSlot, bool turboView);
++void InputProfilesDlg_OnSlotChanged(HWND hDlg, int padSlot, bool turboView);
++int  InputProfilesDlg_OnCommand(HWND hDlg, int controlId, int notifyCode, int padSlot);
++
++#endif
+diff --git a/win32/InputProfilesCore.cpp b/win32/InputProfilesCore.cpp
+new file mode 100644
+index 0000000..25f97f4
+--- /dev/null
++++ b/win32/InputProfilesCore.cpp
+@@ -0,0 +1,372 @@
++/*****************************************************************************\
++     Snes9x - Portable Super Nintendo Entertainment System (TM) emulator.
++                This file is licensed under the Snes9x License.
++   For further information, consult the LICENSE file in the root directory.
++\*****************************************************************************/
++
++// Controller profiles and auto-configure: the platform-independent part.
++// See InputProfilesCore.h.
++
++#include "InputProfilesCore.h"
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++
++namespace inprof {
++
++static const char* const kSlotNames[NUM_SLOTS] =
++{
++	"Up", "Down", "Left", "Right",
++	"A", "B", "X", "Y", "L", "R", "Start", "Select",
++	"UpLeft", "UpRight", "DownLeft", "DownRight",
++	"TurboA", "TurboB", "TurboX", "TurboY", "TurboL", "TurboR", "TurboStart", "TurboSelect",
++	"Autohold", "ClearAll", "TempTurbo", "Autofire"
++};
++
++const char* SlotName(int slot)
++{
++	return (slot >= 0 && slot < NUM_SLOTS) ? kSlotNames[slot] : "";
++}
++
++/*---------------------------------------------------------------------------*/
++// small string helpers
++
++static char LowerAscii(char c)
++{
++	return (c >= 'A' && c <= 'Z') ? (char)(c - 'A' + 'a') : c;
++}
++
++static bool EqualNoCase(const std::string& a, const char* b)
++{
++	size_t n = strlen(b);
++	if (a.size() != n) return false;
++	for (size_t i = 0; i < n; i++)
++		if (LowerAscii(a[i]) != LowerAscii(b[i])) return false;
++	return true;
++}
++
++static bool ContainsNoCase(const std::string& hay, const char* needle)
++{
++	size_t n = strlen(needle);
++	if (n == 0) return true;
++	if (hay.size() < n) return false;
++	for (size_t i = 0; i + n <= hay.size(); i++)
++	{
++		size_t j = 0;
++		while (j < n && LowerAscii(hay[i + j]) == LowerAscii(needle[j])) j++;
++		if (j == n) return true;
++	}
++	return false;
++}
++
++static std::string Trim(const std::string& s)
++{
++	size_t b = 0, e = s.size();
++	while (b < e && (s[b] == ' ' || s[b] == '\t' || s[b] == '\r' || s[b] == '\n')) b++;
++	while (e > b && (s[e - 1] == ' ' || s[e - 1] == '\t' || s[e - 1] == '\r' || s[e - 1] == '\n')) e--;
++	return s.substr(b, e - b);
++}
++
++// values are written on one line
++static std::string OneLine(const std::string& s)
++{
++	std::string r = s;
++	for (size_t i = 0; i < r.size(); i++)
++		if (r[i] == '\r' || r[i] == '\n') r[i] = ' ';
++	return r;
++}
++
++/*---------------------------------------------------------------------------*/
++// device identity
++
++std::string DeviceBaseKey(const DeviceInfo& d)
++{
++	if (d.vendorId != 0 || d.productId != 0)
++	{
++		char buf[16];
++		sprintf(buf, "%04X:%04X", (unsigned)d.vendorId, (unsigned)d.productId);
++		return buf;
++	}
++
++	std::string name = d.name;
++	if (name.size() > (size_t)MAX_KEY_NAME_BYTES)
++	{
++		size_t len = MAX_KEY_NAME_BYTES;
++		while (len > 0 && ((unsigned char)name[len] & 0xC0) == 0x80) len--;   // do not split a UTF-8 character
++		name.erase(len);
++	}
++	return "N:" + name;
++}
++
++static std::string StripOrdinal(const std::string& key)
++{
++	size_t hash = key.rfind('#');
++	return hash == std::string::npos ? key : key.substr(0, hash);
++}
++
++void AssignDeviceKeys(std::vector<DeviceInfo>& devices)
++{
++	for (size_t i = 0; i < devices.size(); i++)
++	{
++		std::string base = DeviceBaseKey(devices[i]);
++		int ordinal = 0;
++		for (size_t j = 0; j < i; j++)
++			if (DeviceBaseKey(devices[j]) == base) ordinal++;
++
++		char buf[16];
++		sprintf(buf, "#%d", ordinal);
++		devices[i].key = base + buf;
++	}
++}
++
++int FindDeviceByKey(const std::vector<DeviceInfo>& devices, const std::string& key, bool allowSameModel)
++{
++	if (key.empty()) return -1;
++
++	for (size_t i = 0; i < devices.size(); i++)
++		if (devices[i].key == key) return (int)i;
++
++	if (!allowSameModel) return -1;
++
++	std::string base = StripOrdinal(key);
++	for (size_t i = 0; i < devices.size(); i++)
++		if (StripOrdinal(devices[i].key) == base) return (int)i;
++
++	return -1;
++}
++
++/*---------------------------------------------------------------------------*/
++// re-pointing bindings
++
++int PrimaryJoyIndex(const Bindings& b)
++{
++	int counts[MAX_JOYSTICKS] = { 0 };
++	for (int i = 0; i < NUM_SLOTS; i++)
++		if (IsJoy(b.v[i])) counts[JoyIndex(b.v[i])]++;
++
++	int best = -1, bestCount = 0;
++	for (int j = 0; j < MAX_JOYSTICKS; j++)
++		if (counts[j] > bestCount) { best = j; bestCount = counts[j]; }
++	return best;
++}
++
++int RetargetJoystick(Bindings& b, int fromJoy, int toJoy)
++{
++	if (fromJoy < 0 || fromJoy >= MAX_JOYSTICKS || toJoy < 0 || toJoy >= MAX_JOYSTICKS || fromJoy == toJoy)
++		return 0;
++
++	int changed = 0;
++	for (int i = 0; i < NUM_SLOTS; i++)
++	{
++		if (IsJoy(b.v[i]) && JoyIndex(b.v[i]) == fromJoy)
++		{
++			b.v[i] = MakeJoy(toJoy, JoyCode(b.v[i]));
++			changed++;
++		}
++	}
++	return changed;
++}
++
++/*---------------------------------------------------------------------------*/
++// auto-configure
++
++namespace
++{
++	// 0-based joystick button numbers (button n is binding code 8 + n)
++	struct ButtonMap { int B, A, Y, X, L, R, Select, Start; };
++
++	// A/B/X/Y = 0/1/2/3, LB/RB = 4/5, Back/Start = 6/7. Positionally: SNES B is the bottom
++	// face button (Xbox A), SNES A the right one (Xbox B), SNES Y the left one (Xbox X)
++	// and SNES X the top one (Xbox Y).
++	const ButtonMap kXbox        = { 0, 1, 2, 3, 4, 5, 6, 7 };
++
++	// Square/Cross/Circle/Triangle = 0/1/2/3, L1/R1 = 4/5, Share/Options = 8/9.
++	// SNES B = Cross, A = Circle, Y = Square, X = Triangle.
++	const ButtonMap kDirectInput = { 1, 2, 0, 3, 4, 5, 8, 9 };
++}
++
++Layout DetectLayout(const DeviceInfo& d)
++{
++	const unsigned vid = d.vendorId, pid = d.productId;
++
++	if (vid == 0x054C)                                   // Sony: DualShock 4, DualSense, ...
++		return LAYOUT_DIRECTINPUT;
++
++	if (vid == 0x046D && (pid == 0xC216 || pid == 0xC218 || pid == 0xC219))  // Logitech in DirectInput mode
++		return LAYOUT_DIRECTINPUT;
++
++	if (vid == 0 && (ContainsNoCase(d.name, "dualshock") || ContainsNoCase(d.name, "dualsense")))
++		return LAYOUT_DIRECTINPUT;
++
++	return LAYOUT_XBOX;
++}
++
++const char* LayoutName(Layout l)
++{
++	switch (l)
++	{
++		case LAYOUT_DIRECTINPUT: return "PlayStation / DirectInput";
++		case LAYOUT_XBOX:
++		default:                 return "Xbox";
++	}
++}
++
++bool AutoConfigure(const DeviceInfo& d, Bindings& out)
++{
++	if (d.index < 0 || d.index >= MAX_JOYSTICKS) return false;
++	if (d.numButtons < 2) return false;
++	if (!d.hasPov && d.numAxes < 2) return false;
++
++	Bindings b = out;
++	for (int i = 0; i < NUM_PAD_SLOTS; i++) b.v[i] = 0;
++
++	if (d.hasPov)
++	{
++		b.v[SLOT_UP]    = MakeJoy(d.index, JC_POV_UP);
++		b.v[SLOT_DOWN]  = MakeJoy(d.index, JC_POV_DOWN);
++		b.v[SLOT_LEFT]  = MakeJoy(d.index, JC_POV_LEFT);
++		b.v[SLOT_RIGHT] = MakeJoy(d.index, JC_POV_RIGHT);
++		// A hat reports a diagonal as one position, not as two directions, so the
++		// diagonals need bindings of their own or they would do nothing.
++		b.v[SLOT_UPLEFT]    = MakeJoy(d.index, JC_POV_UPLEFT);
++		b.v[SLOT_UPRIGHT]   = MakeJoy(d.index, JC_POV_UPRIGHT);
++		b.v[SLOT_DOWNLEFT]  = MakeJoy(d.index, JC_POV_DNLEFT);
++		b.v[SLOT_DOWNRIGHT] = MakeJoy(d.index, JC_POV_DNRIGHT);
++	}
++	else
++	{
++		// Left stick. Two axes crossing their thresholds already press two directions at
++		// once, so no diagonal bindings are needed.
++		b.v[SLOT_UP]    = MakeJoy(d.index, JC_AXIS_UP);
++		b.v[SLOT_DOWN]  = MakeJoy(d.index, JC_AXIS_DOWN);
++		b.v[SLOT_LEFT]  = MakeJoy(d.index, JC_AXIS_LEFT);
++		b.v[SLOT_RIGHT] = MakeJoy(d.index, JC_AXIS_RIGHT);
++	}
++
++	const ButtonMap& m = (DetectLayout(d) == LAYOUT_DIRECTINPUT) ? kDirectInput : kXbox;
++	const struct { int slot; int button; } assign[] =
++	{
++		{ SLOT_B, m.B }, { SLOT_A, m.A }, { SLOT_Y, m.Y }, { SLOT_X, m.X },
++		{ SLOT_L, m.L }, { SLOT_R, m.R }, { SLOT_SELECT, m.Select }, { SLOT_START, m.Start }
++	};
++	for (size_t i = 0; i < sizeof(assign) / sizeof(assign[0]); i++)
++	{
++		// never bind a button the controller does not have
++		if (assign[i].button < d.numButtons && assign[i].button < 32)
++			b.v[assign[i].slot] = MakeJoy(d.index, JC_BUTTON_BASE + assign[i].button);
++	}
++
++	out = b;
++	return true;
++}
++
++/*---------------------------------------------------------------------------*/
++// profile files
++
++std::string SerializeProfile(const Profile& p)
++{
++	std::string s;
++	s += "; Snes9x controller profile\r\n";
++	s += "Format=1\r\n";
++	s += "Name=" + OneLine(p.name) + "\r\n";
++	s += "DeviceKey=" + OneLine(p.deviceKey) + "\r\n";
++	s += "DeviceName=" + OneLine(p.deviceName) + "\r\n";
++	for (int i = 0; i < NUM_SLOTS; i++)
++	{
++		char buf[32];
++		sprintf(buf, "=0x%04X\r\n", (unsigned)p.bindings.v[i]);
++		s += kSlotNames[i];
++		s += buf;
++	}
++	return s;
++}
++
++bool ParseProfile(const std::string& textIn, Profile& out)
++{
++	std::string text = textIn;
++	if (text.size() >= 3 && (unsigned char)text[0] == 0xEF && (unsigned char)text[1] == 0xBB && (unsigned char)text[2] == 0xBF)
++		text.erase(0, 3);                                   // UTF-8 byte order mark
++
++	Profile p;
++	bool haveFormat = false;
++
++	size_t pos = 0;
++	while (pos < text.size())
++	{
++		size_t eol = text.find('\n', pos);
++		if (eol == std::string::npos) eol = text.size();
++		std::string line = Trim(text.substr(pos, eol - pos));
++		pos = eol + 1;
++
++		if (line.empty() || line[0] == ';' || line[0] == '#') continue;
++		size_t eq = line.find('=');
++		if (eq == std::string::npos) continue;
++
++		std::string key = Trim(line.substr(0, eq));
++		std::string val = Trim(line.substr(eq + 1));
++
++		if (EqualNoCase(key, "Format"))
++		{
++			if (val != "1") return false;                   // written by a newer version
++			haveFormat = true;
++		}
++		else if (EqualNoCase(key, "Name"))        p.name = val;
++		else if (EqualNoCase(key, "DeviceKey"))   p.deviceKey = val;
++		else if (EqualNoCase(key, "DeviceName"))  p.deviceName = val;
++		else
++		{
++			for (int i = 0; i < NUM_SLOTS; i++)
++			{
++				if (EqualNoCase(key, kSlotNames[i]))
++				{
++					char* end = NULL;
++					unsigned long v = strtoul(val.c_str(), &end, 0);
++					if (end != val.c_str() && *end == '\0' && v <= 0xFFFF)
++						p.bindings.v[i] = (Binding)v;
++					break;
++				}
++			}
++		}
++	}
++
++	if (!haveFormat) return false;
++	out = p;
++	return true;
++}
++
++std::string SanitizeProfileName(const std::string& in)
++{
++	std::string s;
++	for (size_t i = 0; i < in.size(); i++)
++	{
++		unsigned char c = (unsigned char)in[i];
++		if (c < 0x20 || c == 0x7F) continue;               // control characters
++		if (strchr("\\/:*?\"<>|", c) != NULL) c = '_';     // not allowed in Windows file names
++		s += (char)c;
++	}
++
++	// at most 64 bytes, without cutting a UTF-8 character in half
++	const size_t kMax = 64;
++	if (s.size() > kMax)
++	{
++		size_t len = kMax;
++		while (len > 0 && ((unsigned char)s[len] & 0xC0) == 0x80) len--;
++		s.erase(len);
++	}
++
++	s = Trim(s);
++	while (!s.empty() && (s[s.size() - 1] == '.' || s[s.size() - 1] == ' ')) s.erase(s.size() - 1);
++	if (s.empty()) return s;
++
++	// CON, NUL, COM1, ... cannot be used as file names, with or without an extension
++	std::string stem = s.substr(0, s.find('.'));
++	while (!stem.empty() && stem[stem.size() - 1] == ' ') stem.erase(stem.size() - 1);
++	bool reserved = EqualNoCase(stem, "CON") || EqualNoCase(stem, "PRN") || EqualNoCase(stem, "AUX") || EqualNoCase(stem, "NUL");
++	if (stem.size() == 4 && (EqualNoCase(stem.substr(0, 3), "COM") || EqualNoCase(stem.substr(0, 3), "LPT")) && stem[3] >= '1' && stem[3] <= '9')
++		reserved = true;
++	if (reserved) s = "_" + s;
++
++	return s;
++}
++
++} // namespace inprof
+diff --git a/win32/InputProfilesCore.h b/win32/InputProfilesCore.h
+new file mode 100644
+index 0000000..319f0cf
+--- /dev/null
++++ b/win32/InputProfilesCore.h
+@@ -0,0 +1,214 @@
++/*****************************************************************************\
++     Snes9x - Portable Super Nintendo Entertainment System (TM) emulator.
++                This file is licensed under the Snes9x License.
++   For further information, consult the LICENSE file in the root directory.
++\*****************************************************************************/
++
++// Controller profiles and auto-configure: the platform-independent part.
++//
++// Nothing in here touches Windows. It works on plain data (a "Bindings" array and
++// a description of a game controller), so it can be unit tested anywhere
++// (see win32/tests/inputprofiles_core_test.cpp). The Windows side
++// (InputProfiles.cpp) feeds it real devices and real SJoypad structs.
++
++#ifndef S9X_INPUTPROFILES_CORE_H_INCLUDED
++#define S9X_INPUTPROFILES_CORE_H_INCLUDED
++
++#include <stdint.h>
++#include <string>
++#include <vector>
++
++namespace inprof {
++
++typedef uint16_t Binding;
++
++/*---------------------------------------------------------------------------*\
++  Binding encoding. This mirrors S9xGetState() in win32.cpp:
++    keyboard:  a Windows virtual-key code (< 0x100), 0 = unbound
++    joystick:  0x8000 | (joystick id << 8) | code
++\*---------------------------------------------------------------------------*/
++enum
++{
++	JOY_FLAG        = 0x8000,
++
++	JC_AXIS_LEFT    = 0,    // X axis negative
++	JC_AXIS_RIGHT   = 1,
++	JC_AXIS_UP      = 2,    // Y axis negative
++	JC_AXIS_DOWN    = 3,
++	JC_POV_LEFT     = 4,
++	JC_POV_RIGHT    = 5,
++	JC_POV_UP       = 6,
++	JC_POV_DOWN     = 7,
++	JC_BUTTON_BASE  = 8,    // button n (0-based) is code 8 + n, n = 0..31
++	JC_POV_DNLEFT   = 49,
++	JC_POV_DNRIGHT  = 50,
++	JC_POV_UPLEFT   = 51,
++	JC_POV_UPRIGHT  = 52,
++
++	MAX_JOYSTICKS   = 16
++};
++
++inline bool    IsJoy(Binding b)               { return (b & JOY_FLAG) != 0; }
++inline int     JoyIndex(Binding b)            { return (b >> 8) & 0x0F; }
++inline int     JoyCode(Binding b)             { return b & 0xFF; }
++inline Binding MakeJoy(int joy, int code)     { return (Binding)(JOY_FLAG | ((joy & 0x0F) << 8) | (code & 0xFF)); }
++
++/*---------------------------------------------------------------------------*\
++  All bindings that belong to one player slot: the 16 pad inputs followed by the
++  12 inputs of that slot's "Turbo" panel.
++\*---------------------------------------------------------------------------*/
++enum Slot
++{
++	SLOT_UP, SLOT_DOWN, SLOT_LEFT, SLOT_RIGHT,
++	SLOT_A, SLOT_B, SLOT_X, SLOT_Y, SLOT_L, SLOT_R, SLOT_START, SLOT_SELECT,
++	SLOT_UPLEFT, SLOT_UPRIGHT, SLOT_DOWNLEFT, SLOT_DOWNRIGHT,
++	NUM_PAD_SLOTS,                                   // 16
++
++	SLOT_TURBO_A = NUM_PAD_SLOTS, SLOT_TURBO_B, SLOT_TURBO_X, SLOT_TURBO_Y,
++	SLOT_TURBO_L, SLOT_TURBO_R, SLOT_TURBO_START, SLOT_TURBO_SELECT,
++	SLOT_AUTOHOLD, SLOT_CLEARALL, SLOT_TEMPTURBO, SLOT_AUTOFIRE,
++	NUM_SLOTS                                        // 28
++};
++
++const char* SlotName(int slot);   // the key used in profile files ("Up", "TurboA", ...)
++
++struct Bindings
++{
++	Binding v[NUM_SLOTS];
++	Bindings() { for (int i = 0; i < NUM_SLOTS; i++) v[i] = 0; }
++};
++
++/*---------------------------------------------------------------------------*\
++  Generic copy between Bindings and Snes9x's SJoypad pair (main pad + turbo panel).
++  A template so this header does not need wsnes9x.h; it works with any struct that
++  has SJoypad's field names (the unions Left/Autohold, Right/ClearAll, Up/TempTurbo
++  and Down/Autofire share storage in the real struct, which is exactly how the
++  turbo panel is stored).
++\*---------------------------------------------------------------------------*/
++template <class PadT>
++void ReadBindings(const PadT& pad, const PadT& turbo, Bindings& out)
++{
++	out.v[SLOT_UP] = pad.Up;           out.v[SLOT_DOWN] = pad.Down;
++	out.v[SLOT_LEFT] = pad.Left;       out.v[SLOT_RIGHT] = pad.Right;
++	out.v[SLOT_A] = pad.A;             out.v[SLOT_B] = pad.B;
++	out.v[SLOT_X] = pad.X;             out.v[SLOT_Y] = pad.Y;
++	out.v[SLOT_L] = pad.L;             out.v[SLOT_R] = pad.R;
++	out.v[SLOT_START] = pad.Start;     out.v[SLOT_SELECT] = pad.Select;
++	out.v[SLOT_UPLEFT] = pad.Left_Up;  out.v[SLOT_UPRIGHT] = pad.Right_Up;
++	out.v[SLOT_DOWNLEFT] = pad.Left_Down; out.v[SLOT_DOWNRIGHT] = pad.Right_Down;
++
++	out.v[SLOT_TURBO_A] = turbo.A;     out.v[SLOT_TURBO_B] = turbo.B;
++	out.v[SLOT_TURBO_X] = turbo.X;     out.v[SLOT_TURBO_Y] = turbo.Y;
++	out.v[SLOT_TURBO_L] = turbo.L;     out.v[SLOT_TURBO_R] = turbo.R;
++	out.v[SLOT_TURBO_START] = turbo.Start; out.v[SLOT_TURBO_SELECT] = turbo.Select;
++	out.v[SLOT_AUTOHOLD] = turbo.Autohold;   out.v[SLOT_CLEARALL] = turbo.ClearAll;
++	out.v[SLOT_TEMPTURBO] = turbo.TempTurbo; out.v[SLOT_AUTOFIRE] = turbo.Autofire;
++}
++
++template <class PadT>
++void WriteBindings(const Bindings& in, PadT& pad, PadT& turbo)
++{
++	pad.Up = in.v[SLOT_UP];            pad.Down = in.v[SLOT_DOWN];
++	pad.Left = in.v[SLOT_LEFT];        pad.Right = in.v[SLOT_RIGHT];
++	pad.A = in.v[SLOT_A];              pad.B = in.v[SLOT_B];
++	pad.X = in.v[SLOT_X];              pad.Y = in.v[SLOT_Y];
++	pad.L = in.v[SLOT_L];              pad.R = in.v[SLOT_R];
++	pad.Start = in.v[SLOT_START];      pad.Select = in.v[SLOT_SELECT];
++	pad.Left_Up = in.v[SLOT_UPLEFT];   pad.Right_Up = in.v[SLOT_UPRIGHT];
++	pad.Left_Down = in.v[SLOT_DOWNLEFT]; pad.Right_Down = in.v[SLOT_DOWNRIGHT];
++
++	turbo.A = in.v[SLOT_TURBO_A];      turbo.B = in.v[SLOT_TURBO_B];
++	turbo.X = in.v[SLOT_TURBO_X];      turbo.Y = in.v[SLOT_TURBO_Y];
++	turbo.L = in.v[SLOT_TURBO_L];      turbo.R = in.v[SLOT_TURBO_R];
++	turbo.Start = in.v[SLOT_TURBO_START]; turbo.Select = in.v[SLOT_TURBO_SELECT];
++	turbo.Autohold = in.v[SLOT_AUTOHOLD];   turbo.ClearAll = in.v[SLOT_CLEARALL];
++	turbo.TempTurbo = in.v[SLOT_TEMPTURBO]; turbo.Autofire = in.v[SLOT_AUTOFIRE];
++}
++
++/*---------------------------------------------------------------------------*\
++  Game controllers
++\*---------------------------------------------------------------------------*/
++struct DeviceInfo
++{
++	int         index;        // Windows joystick id (0..15): what bindings refer to
++	std::string name;         // display name, UTF-8
++	uint16_t    vendorId;
++	uint16_t    productId;
++	int         numButtons;
++	int         numAxes;
++	bool        hasPov;       // has a d-pad / hat
++	std::string key;          // stable identity, see AssignDeviceKeys()
++
++	DeviceInfo() : index(0), vendorId(0), productId(0), numButtons(0), numAxes(0), hasPov(false) {}
++};
++
++// "045E:028E" when the vendor/product ids are known, otherwise "N:<name>" (the name cut
++// to MAX_KEY_NAME_BYTES so a key always fits the fixed-size field in snes9x.conf).
++const int MAX_KEY_NAME_BYTES = 64;
++std::string DeviceBaseKey(const DeviceInfo& d);
++
++// Sets .key of every device to "<base>#<n>", n counting devices with the same base
++// key in list order. Two identical controllers therefore get #0 and #1.
++void AssignDeviceKeys(std::vector<DeviceInfo>& devices);
++
++// Position in 'devices' (not the Windows id) of the device with this key, or -1.
++// With allowSameModel, a key that is not connected (say "...#1" when only one such
++// controller is plugged in) falls back to the first device with the same base key.
++// That is right for suggesting a controller for a profile, but not for silently
++// re-pointing a player: two players must never end up on one physical controller.
++int FindDeviceByKey(const std::vector<DeviceInfo>& devices, const std::string& key, bool allowSameModel = true);
++
++/*---------------------------------------------------------------------------*\
++  Re-pointing bindings at another physical controller
++\*---------------------------------------------------------------------------*/
++
++// The joystick id used by most of the joystick bindings (lowest id on a tie), or -1
++// if every binding is a keyboard key / unbound.
++int PrimaryJoyIndex(const Bindings& b);
++
++// Changes every joystick binding that refers to joystick 'fromJoy' so it refers to
++// 'toJoy' instead. Button/axis/hat codes are untouched. Returns how many changed.
++int RetargetJoystick(Bindings& b, int fromJoy, int toJoy);
++
++/*---------------------------------------------------------------------------*\
++  Auto-configure
++\*---------------------------------------------------------------------------*/
++enum Layout
++{
++	LAYOUT_XBOX,          // A/B/X/Y = buttons 0-3, Back/Start = 6/7 (XInput order; also the fallback)
++	LAYOUT_DIRECTINPUT    // Square/Cross/Circle/Triangle = 0-3, Share/Options = 8/9 (DualShock 4, DualSense, Logitech DInput)
++};
++
++Layout      DetectLayout(const DeviceInfo& d);
++const char* LayoutName(Layout l);
++
++// Fills the 16 pad slots of 'out' for this controller, "same physical position" style:
++// the SNES B button goes on the bottom face button, A on the right, Y on the left,
++// X on the top, plus shoulders, Select and Start. D-pad is used for directions when
++// the controller has one (including its diagonals), else the left stick.
++// The turbo slots of 'out' are left alone. Returns false (and leaves 'out' alone) if
++// the device does not look like a usable gamepad.
++bool AutoConfigure(const DeviceInfo& d, Bindings& out);
++
++/*---------------------------------------------------------------------------*\
++  Profiles: a named set of bindings plus the controller they were made for.
++\*---------------------------------------------------------------------------*/
++struct Profile
++{
++	std::string name;
++	std::string deviceKey;    // DeviceInfo::key of the controller it was saved from ("" = keyboard only)
++	std::string deviceName;   // for display only
++	Bindings    bindings;
++};
++
++std::string SerializeProfile(const Profile& p);
++bool        ParseProfile(const std::string& text, Profile& out);
++
++// Turns what the user typed into something safe to use as a file name (no path
++// separators or other characters Windows forbids, no reserved device names, no
++// trailing dots/spaces, at most 64 bytes). Returns "" if nothing usable is left.
++std::string SanitizeProfileName(const std::string& in);
++
++} // namespace inprof
++
++#endif
+diff --git a/win32/rsrc/resource.h b/win32/rsrc/resource.h
+index b9ddb6d..dfc26ac 100644
+--- a/win32/rsrc/resource.h
++++ b/win32/rsrc/resource.h
+@@ -403,6 +403,17 @@
+ #define IDC_SFX_CLOCK_SPEED_SPIN        3036
+ #define IDC_NO_SPRITE_LIMIT             3037
+ #define IDC_SET_DEFAULTS                3038
++#define IDC_DEVCOMBO                    3039
++#define IDC_DEV_REFRESH                 3040
++#define IDC_AUTOCONFIG                  3041
++#define IDC_PROFILECOMBO                3042
++#define IDC_PROFILE_LOAD                3043
++#define IDC_PROFILE_SAVE                3044
++#define IDC_PROFILE_DELETE              3045
++#define IDC_LABEL_DEVICE                3046
++#define IDC_LABEL_PROFILE               3047
++#define IDC_PROFILE_STATUS              3048
++#define IDC_GROUP_PROFILES              3049
+ #define ID_FILE_EXIT                    40001
+ #define ID_WINDOW_HIDEMENUBAR           40004
+ #define ID_FILE_AVI_RECORDING           40005
+@@ -550,7 +561,7 @@
+ #ifndef APSTUDIO_READONLY_SYMBOLS
+ #define _APS_NEXT_RESOURCE_VALUE        167
+ #define _APS_NEXT_COMMAND_VALUE         40179
+-#define _APS_NEXT_CONTROL_VALUE         3039
++#define _APS_NEXT_CONTROL_VALUE         3050
+ #define _APS_NEXT_SYMED_VALUE           101
+ #endif
+ #endif
+diff --git a/win32/rsrc/snes9x.rc b/win32/rsrc/snes9x.rc
+index 775004a..d74cb5b 100644
+--- a/win32/rsrc/snes9x.rc
++++ b/win32/rsrc/snes9x.rc
+@@ -250,7 +250,7 @@ BEGIN
+     CONTROL         "Progress1",IDC_NPPROGRESS,"msctls_progress32",WS_BORDER,6,30,174,25
+ END
+ 
+-IDD_INPUTCONFIG DIALOGEX 0, 0, 330, 172
++IDD_INPUTCONFIG DIALOGEX 0, 0, 330, 220
+ STYLE DS_SETFONT | DS_MODALFRAME | DS_3DLOOK | DS_FIXEDSYS | DS_CENTER | WS_POPUP | WS_CLIPCHILDREN | WS_CAPTION
+ CAPTION " "
+ FONT 8, "MS Shell Dlg", 400, 0, 0x1
+@@ -273,8 +273,8 @@ BEGIN
+     CONTROL         " ",IDC_UPRIGHT,"InputCustom",WS_DISABLED | WS_TABSTOP,161,104,71,12,WS_EX_CLIENTEDGE
+     CONTROL         " ",IDC_DWNRIGHT,"InputCustom",WS_DISABLED | WS_TABSTOP,161,117,71,12,WS_EX_CLIENTEDGE
+     CONTROL         " ",IDC_DWNLEFT,"InputCustom",WS_DISABLED | WS_TABSTOP,161,130,71,12,WS_EX_CLIENTEDGE
+-    PUSHBUTTON      "Cancel",IDCANCEL,276,152,48,14
+-    PUSHBUTTON      "OK",IDOK,222,152,48,14
++    PUSHBUTTON      "Cancel",IDCANCEL,276,201,48,14
++    PUSHBUTTON      "OK",IDOK,222,201,48,14
+     LTEXT           "Blue means the button is already mapped.\nPink means it conflicts with a custom hotkey.\nRed means it's reserved by Windows.\nButtons can be disabled using Escape.",IDC_LABEL_BLUE,162,0,161,32
+     RTEXT           "UP",IDC_LABEL_UP,8,42,38,8
+     RTEXT           "RIGHT",IDC_LABEL_RIGHT,6,81,41,8
+@@ -296,6 +296,17 @@ BEGIN
+     CONTROL         "Allow Left+Rt/Up+Dn",IDC_ALLOWLEFTRIGHT,"Button",BS_AUTOCHECKBOX | WS_TABSTOP,243,132,87,11
+     GROUPBOX        "Controller",IDC_STATIC,5,1,142,28,0,WS_EX_TRANSPARENT
+     GROUPBOX        "Buttons",IDC_STATIC,5,30,234,118,0,WS_EX_TRANSPARENT
++    GROUPBOX        "Device and Profile",IDC_GROUP_PROFILES,5,150,319,46,0,WS_EX_TRANSPARENT
++    LTEXT           "Device:",IDC_LABEL_DEVICE,11,164,30,8
++    COMBOBOX        IDC_DEVCOMBO,44,161,150,80,CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP
++    PUSHBUTTON      "Refresh",IDC_DEV_REFRESH,198,160,40,14
++    PUSHBUTTON      "Auto-Configure",IDC_AUTOCONFIG,244,160,74,14
++    LTEXT           "Profile:",IDC_LABEL_PROFILE,11,182,30,8
++    COMBOBOX        IDC_PROFILECOMBO,44,179,150,80,CBS_DROPDOWN | CBS_AUTOHSCROLL | WS_VSCROLL | WS_TABSTOP
++    PUSHBUTTON      "Load",IDC_PROFILE_LOAD,198,178,40,14
++    PUSHBUTTON      "Save",IDC_PROFILE_SAVE,244,178,36,14
++    PUSHBUTTON      "Delete",IDC_PROFILE_DELETE,282,178,36,14
++    LTEXT           "",IDC_PROFILE_STATUS,6,203,212,10,SS_ENDELLIPSIS
+ END
+ 
+ IDD_CHEAT_SEARCH DIALOGEX 0, 0, 276, 276
+@@ -664,7 +675,7 @@ BEGIN
+         RIGHTMARGIN, 326
+         VERTGUIDE, 77
+         VERTGUIDE, 92
+-        BOTTOMMARGIN, 163
++        BOTTOMMARGIN, 213
+         HORZGUIDE, 122
+     END
+ 
+diff --git a/win32/snes9xw.vcxproj b/win32/snes9xw.vcxproj
+index a9c54df..8615203 100644
+--- a/win32/snes9xw.vcxproj
++++ b/win32/snes9xw.vcxproj
+@@ -445,6 +445,8 @@
+     <ClInclude Include="gl_core_3_1.h" />
+     <ClInclude Include="image_functions.h" />
+     <ClInclude Include="InputCustom.h" />
++    <ClInclude Include="InputProfiles.h" />
++    <ClInclude Include="InputProfilesCore.h" />
+     <ClInclude Include="IS9xDisplayOutput.h" />
+     <ClInclude Include="IS9xSoundOutput.h" />
+     <ClInclude Include="render.h" />
+@@ -587,6 +589,8 @@
+     <ClCompile Include="gl_core_3_1.c" />
+     <ClCompile Include="image_functions.cpp" />
+     <ClCompile Include="InputCustom.cpp" />
++    <ClCompile Include="InputProfiles.cpp" />
++    <ClCompile Include="InputProfilesCore.cpp" />
+     <ClCompile Include="render.cpp" />
+     <ClCompile Include="wconfig.cpp" />
+     <ClCompile Include="win32.cpp" />
+diff --git a/win32/snes9xw.vcxproj.filters b/win32/snes9xw.vcxproj.filters
+index 858ebe5..0a91e00 100644
+--- a/win32/snes9xw.vcxproj.filters
++++ b/win32/snes9xw.vcxproj.filters
+@@ -81,6 +81,12 @@
+     <ClInclude Include="InputCustom.h">
+       <Filter>GUI</Filter>
+     </ClInclude>
++    <ClInclude Include="InputProfiles.h">
++      <Filter>GUI</Filter>
++    </ClInclude>
++    <ClInclude Include="InputProfilesCore.h">
++      <Filter>GUI</Filter>
++    </ClInclude>
+     <ClInclude Include="render.h">
+       <Filter>GUI</Filter>
+     </ClInclude>
+@@ -470,6 +476,12 @@
+     <ClCompile Include="InputCustom.cpp">
+       <Filter>GUI</Filter>
+     </ClCompile>
++    <ClCompile Include="InputProfiles.cpp">
++      <Filter>GUI</Filter>
++    </ClCompile>
++    <ClCompile Include="InputProfilesCore.cpp">
++      <Filter>GUI</Filter>
++    </ClCompile>
+     <ClCompile Include="render.cpp">
+       <Filter>GUI</Filter>
+     </ClCompile>
+diff --git a/win32/tests/inputprofiles_core_test.cpp b/win32/tests/inputprofiles_core_test.cpp
+new file mode 100644
+index 0000000..1ccd5aa
+--- /dev/null
++++ b/win32/tests/inputprofiles_core_test.cpp
+@@ -0,0 +1,388 @@
++// Unit tests for the platform-independent part of the controller profile feature.
++// Not part of the Visual Studio project. Build and run on any OS, see run_tests.sh.
++
++#include "../InputProfilesCore.h"
++#include <stdio.h>
++#include <string.h>
++
++#ifdef HAVE_REAL_SJOYPAD
++// typedefs the real struct needs; the struct itself is cut out of wsnes9x.h by run_tests.sh
++typedef unsigned short WORD;
++typedef int BOOL;
++#include "sjoypad_real.h"
++#endif
++
++using namespace inprof;
++
++static int g_checks = 0, g_failed = 0;
++#define CHECK(cond) do { g_checks++; if (!(cond)) { g_failed++; printf("  FAIL line %d: %s\n", __LINE__, #cond); } } while (0)
++#define CHECK_EQ(a, b) do { g_checks++; if (!((a) == (b))) { g_failed++; printf("  FAIL line %d: %s == %s\n", __LINE__, #a, #b); } } while (0)
++
++static DeviceInfo Dev(int index, const char* name, unsigned vid, unsigned pid, int buttons, int axes, bool pov)
++{
++	DeviceInfo d;
++	d.index = index; d.name = name; d.vendorId = (uint16_t)vid; d.productId = (uint16_t)pid;
++	d.numButtons = buttons; d.numAxes = axes; d.hasPov = pov;
++	return d;
++}
++
++static void test_encoding()
++{
++	printf("encoding\n");
++	Binding b = MakeJoy(3, 52);
++	CHECK_EQ(b, 0x8334);
++	CHECK(IsJoy(b)); CHECK_EQ(JoyIndex(b), 3); CHECK_EQ(JoyCode(b), 52);
++	CHECK(!IsJoy(0x41)); CHECK(!IsJoy(0));
++	CHECK_EQ(MakeJoy(0, JC_BUTTON_BASE + 5), 0x800D);
++	CHECK_EQ(MakeJoy(15, 7), 0x8F07);
++	CHECK_EQ(MakeJoy(16, 7), 0x8007);               // id wraps like the 4 bit field in S9xGetState
++}
++
++static void test_slot_names()
++{
++	printf("slot names\n");
++	for (int i = 0; i < NUM_SLOTS; i++)
++	{
++		CHECK(strlen(SlotName(i)) > 0);
++		for (int j = i + 1; j < NUM_SLOTS; j++) CHECK(strcmp(SlotName(i), SlotName(j)) != 0);
++	}
++	CHECK_EQ(NUM_SLOTS, 28);
++	CHECK_EQ(NUM_PAD_SLOTS, 16);
++	CHECK(strcmp(SlotName(-1), "") == 0);
++	CHECK(strcmp(SlotName(NUM_SLOTS), "") == 0);
++}
++
++static void test_primary_and_retarget()
++{
++	printf("primary / retarget\n");
++	Bindings b;
++	CHECK_EQ(PrimaryJoyIndex(b), -1);
++
++	b.v[SLOT_UP] = 'W'; b.v[SLOT_A] = 'Z';              // keyboard only
++	CHECK_EQ(PrimaryJoyIndex(b), -1);
++
++	b.v[SLOT_B] = MakeJoy(4, 8);
++	CHECK_EQ(PrimaryJoyIndex(b), 4);
++	b.v[SLOT_X] = MakeJoy(1, 9);                        // 1 vs 1: tie -> lowest id
++	CHECK_EQ(PrimaryJoyIndex(b), 1);
++	b.v[SLOT_Y] = MakeJoy(4, 10);                       // 4 now has two
++	CHECK_EQ(PrimaryJoyIndex(b), 4);
++	b.v[SLOT_AUTOHOLD] = MakeJoy(1, 11); b.v[SLOT_TURBO_A] = MakeJoy(1, 12);   // turbo slots count too
++	CHECK_EQ(PrimaryJoyIndex(b), 1);
++
++	CHECK_EQ(RetargetJoystick(b, 4, 7), 2);
++	CHECK_EQ(b.v[SLOT_B], MakeJoy(7, 8));
++	CHECK_EQ(b.v[SLOT_Y], MakeJoy(7, 10));
++	CHECK_EQ(b.v[SLOT_X], MakeJoy(1, 9));               // other device untouched
++	CHECK_EQ(b.v[SLOT_UP], 'W');                        // keyboard untouched
++	CHECK_EQ(b.v[SLOT_A], 'Z');
++
++	CHECK_EQ(RetargetJoystick(b, 1, 1), 0);             // same id
++	CHECK_EQ(RetargetJoystick(b, -1, 2), 0);
++	CHECK_EQ(RetargetJoystick(b, 1, 16), 0);
++	CHECK_EQ(RetargetJoystick(b, 9, 2), 0);             // nothing on 9
++}
++
++static void test_device_keys()
++{
++	printf("device keys\n");
++	std::vector<DeviceInfo> v;
++	v.push_back(Dev(0, "Pad A", 0x045E, 0x028E, 10, 5, true));
++	v.push_back(Dev(1, "Pad A", 0x045E, 0x028E, 10, 5, true));    // identical model
++	v.push_back(Dev(3, "Wireless Controller", 0x054C, 0x09CC, 14, 6, true));
++	v.push_back(Dev(4, "Mystery", 0, 0, 8, 2, false));            // no ids: falls back to the name
++	AssignDeviceKeys(v);
++
++	CHECK(v[0].key == "045E:028E#0");
++	CHECK(v[1].key == "045E:028E#1");
++	CHECK(v[2].key == "054C:09CC#0");
++	CHECK(v[3].key == "N:Mystery#0");
++
++	CHECK_EQ(FindDeviceByKey(v, "045E:028E#1"), 1);
++	CHECK_EQ(FindDeviceByKey(v, "054C:09CC#0"), 2);
++	CHECK_EQ(FindDeviceByKey(v, "N:Mystery#0"), 3);
++	CHECK_EQ(FindDeviceByKey(v, "045E:028E#7"), 0);               // same model, other ordinal -> first of that model
++	CHECK_EQ(FindDeviceByKey(v, "045E:028E#7", false), -1);       // ... unless only an exact match is acceptable
++	CHECK_EQ(FindDeviceByKey(v, "045E:028E#1", false), 1);
++	CHECK_EQ(FindDeviceByKey(v, "1234:5678#0"), -1);
++	CHECK_EQ(FindDeviceByKey(v, ""), -1);
++	CHECK_EQ(FindDeviceByKey(std::vector<DeviceInfo>(), "045E:028E#0"), -1);
++
++	// one of the two identical pads is unplugged: the #0 pad is still found, #1 only on request
++	std::vector<DeviceInfo> one(v.begin(), v.begin() + 1);
++	AssignDeviceKeys(one);
++	CHECK_EQ(FindDeviceByKey(one, "045E:028E#0", false), 0);
++	CHECK_EQ(FindDeviceByKey(one, "045E:028E#1"), 0);
++	CHECK_EQ(FindDeviceByKey(one, "045E:028E#1", false), -1);   // player 2 must not grab player 1's pad
++
++	// very long names still give short keys, and a multi-byte character is never cut in half
++	std::vector<DeviceInfo> lng;
++	lng.push_back(Dev(0, (std::string(63, 'x') + "\xC3\xA9" + "tail").c_str(), 0, 0, 8, 2, false));
++	AssignDeviceKeys(lng);
++	CHECK(lng[0].key == "N:" + std::string(63, 'x') + "#0");
++	std::vector<DeviceInfo> lng2;
++	lng2.push_back(Dev(0, std::string(200, 'y').c_str(), 0, 0, 8, 2, false));
++	AssignDeviceKeys(lng2);
++	CHECK_EQ(lng2[0].key.size(), (size_t)(2 + MAX_KEY_NAME_BYTES + 2));
++}
++
++static void test_autoconfigure_xbox_pov()
++{
++	printf("auto-configure: Xbox layout, d-pad\n");
++	DeviceInfo d = Dev(2, "Controller (XBOX 360 For Windows)", 0x045E, 0x028E, 10, 5, true);
++	CHECK_EQ(DetectLayout(d), LAYOUT_XBOX);
++
++	Bindings b;
++	b.v[SLOT_A] = 'V'; b.v[SLOT_UPLEFT] = 'Q';                    // old stuff must go
++	b.v[SLOT_TURBO_A] = 'T'; b.v[SLOT_AUTOHOLD] = 'H';            // turbo panel must stay
++	CHECK(AutoConfigure(d, b));
++
++	CHECK_EQ(b.v[SLOT_UP],    MakeJoy(2, JC_POV_UP));
++	CHECK_EQ(b.v[SLOT_DOWN],  MakeJoy(2, JC_POV_DOWN));
++	CHECK_EQ(b.v[SLOT_LEFT],  MakeJoy(2, JC_POV_LEFT));
++	CHECK_EQ(b.v[SLOT_RIGHT], MakeJoy(2, JC_POV_RIGHT));
++	CHECK_EQ(b.v[SLOT_UPLEFT],    MakeJoy(2, 51));
++	CHECK_EQ(b.v[SLOT_UPRIGHT],   MakeJoy(2, 52));
++	CHECK_EQ(b.v[SLOT_DOWNLEFT],  MakeJoy(2, 49));
++	CHECK_EQ(b.v[SLOT_DOWNRIGHT], MakeJoy(2, 50));
++	CHECK_EQ(b.v[SLOT_B],      MakeJoy(2, 8 + 0));                // bottom face button
++	CHECK_EQ(b.v[SLOT_A],      MakeJoy(2, 8 + 1));                // right
++	CHECK_EQ(b.v[SLOT_Y],      MakeJoy(2, 8 + 2));                // left
++	CHECK_EQ(b.v[SLOT_X],      MakeJoy(2, 8 + 3));                // top
++	CHECK_EQ(b.v[SLOT_L],      MakeJoy(2, 8 + 4));
++	CHECK_EQ(b.v[SLOT_R],      MakeJoy(2, 8 + 5));
++	CHECK_EQ(b.v[SLOT_SELECT], MakeJoy(2, 8 + 6));
++	CHECK_EQ(b.v[SLOT_START],  MakeJoy(2, 8 + 7));
++	CHECK_EQ(b.v[SLOT_TURBO_A], 'T');
++	CHECK_EQ(b.v[SLOT_AUTOHOLD], 'H');
++	CHECK_EQ(PrimaryJoyIndex(b), 2);
++
++	// every assigned binding must be distinct (no two buttons on one input)
++	for (int i = 0; i < NUM_PAD_SLOTS; i++)
++		for (int j = i + 1; j < NUM_PAD_SLOTS; j++)
++			if (b.v[i] != 0) CHECK(b.v[i] != b.v[j]);
++}
++
++static void test_autoconfigure_playstation()
++{
++	printf("auto-configure: PlayStation layout\n");
++	DeviceInfo d = Dev(0, "Wireless Controller", 0x054C, 0x09CC, 14, 6, true);
++	CHECK_EQ(DetectLayout(d), LAYOUT_DIRECTINPUT);
++	Bindings b;
++	CHECK(AutoConfigure(d, b));
++	CHECK_EQ(b.v[SLOT_B],      MakeJoy(0, 8 + 1));                // Cross
++	CHECK_EQ(b.v[SLOT_A],      MakeJoy(0, 8 + 2));                // Circle
++	CHECK_EQ(b.v[SLOT_Y],      MakeJoy(0, 8 + 0));                // Square
++	CHECK_EQ(b.v[SLOT_X],      MakeJoy(0, 8 + 3));                // Triangle
++	CHECK_EQ(b.v[SLOT_L],      MakeJoy(0, 8 + 4));
++	CHECK_EQ(b.v[SLOT_R],      MakeJoy(0, 8 + 5));
++	CHECK_EQ(b.v[SLOT_SELECT], MakeJoy(0, 8 + 8));                // Share
++	CHECK_EQ(b.v[SLOT_START],  MakeJoy(0, 8 + 9));                // Options
++
++	CHECK_EQ(DetectLayout(Dev(0, "Logitech Dual Action", 0x046D, 0xC216, 12, 4, true)), LAYOUT_DIRECTINPUT);
++	CHECK_EQ(DetectLayout(Dev(0, "Logitech F310 in XInput mode", 0x046D, 0xC21D, 10, 5, true)), LAYOUT_XBOX);
++	CHECK_EQ(DetectLayout(Dev(0, "DualSense Wireless Controller", 0, 0, 14, 6, true)), LAYOUT_DIRECTINPUT);   // ids unknown, name known
++	CHECK_EQ(DetectLayout(Dev(0, "Some pad", 0, 0, 10, 4, true)), LAYOUT_XBOX);                                // unknown -> fallback
++}
++
++static void test_autoconfigure_edge_cases()
++{
++	printf("auto-configure: edge cases\n");
++
++	// no d-pad: left stick, and no diagonals
++	{
++		DeviceInfo d = Dev(5, "Stick pad", 0x1234, 0x5678, 8, 2, false);
++		Bindings b; b.v[SLOT_UPLEFT] = 'Q';
++		CHECK(AutoConfigure(d, b));
++		CHECK_EQ(b.v[SLOT_UP],    MakeJoy(5, JC_AXIS_UP));
++		CHECK_EQ(b.v[SLOT_DOWN],  MakeJoy(5, JC_AXIS_DOWN));
++		CHECK_EQ(b.v[SLOT_LEFT],  MakeJoy(5, JC_AXIS_LEFT));
++		CHECK_EQ(b.v[SLOT_RIGHT], MakeJoy(5, JC_AXIS_RIGHT));
++		CHECK_EQ(b.v[SLOT_UPLEFT], 0); CHECK_EQ(b.v[SLOT_UPRIGHT], 0);
++		CHECK_EQ(b.v[SLOT_DOWNLEFT], 0); CHECK_EQ(b.v[SLOT_DOWNRIGHT], 0);
++	}
++	// only 6 buttons: Select/Start (buttons 6,7) do not exist and must stay unbound
++	{
++		DeviceInfo d = Dev(1, "Small pad", 0x1111, 0x2222, 6, 2, true);
++		Bindings b;
++		CHECK(AutoConfigure(d, b));
++		CHECK_EQ(b.v[SLOT_R], MakeJoy(1, 8 + 5));
++		CHECK_EQ(b.v[SLOT_SELECT], 0);
++		CHECK_EQ(b.v[SLOT_START], 0);
++	}
++	// not a usable gamepad: false, and the bindings are left alone
++	{
++		Bindings b; b.v[SLOT_A] = 'V'; b.v[SLOT_UP] = MakeJoy(3, 6);
++		CHECK(!AutoConfigure(Dev(0, "Throttle", 1, 1, 1, 3, false), b));    // < 2 buttons
++		CHECK(!AutoConfigure(Dev(0, "Button box", 1, 1, 8, 0, false), b));  // no hat, no axes
++		CHECK(!AutoConfigure(Dev(16, "Bad id", 1, 1, 10, 2, true), b));
++		CHECK(!AutoConfigure(Dev(-1, "Bad id", 1, 1, 10, 2, true), b));
++		CHECK_EQ(b.v[SLOT_A], 'V');
++		CHECK_EQ(b.v[SLOT_UP], MakeJoy(3, 6));
++	}
++	// 32 buttons never index past bit 31
++	{
++		DeviceInfo d = Dev(0, "Big", 1, 1, 32, 6, true);
++		Bindings b; CHECK(AutoConfigure(d, b));
++		CHECK_EQ(JoyCode(b.v[SLOT_START]), 8 + 7);
++	}
++}
++
++static void test_reorder_scenario()
++{
++	printf("scenario: controller enumerates at a different id\n");
++	// Player 1 was configured while the pad was joystick 0
++	std::vector<DeviceInfo> before;
++	before.push_back(Dev(0, "Pad", 0x045E, 0x028E, 10, 5, true));
++	AssignDeviceKeys(before);
++	Bindings b;
++	AutoConfigure(before[0], b);
++	std::string remembered = before[0].key;
++	Bindings original = b;
++
++	// next session Windows lists a different device first
++	std::vector<DeviceInfo> after;
++	after.push_back(Dev(0, "Other", 0x046D, 0xC21D, 10, 5, true));
++	after.push_back(Dev(1, "Pad", 0x045E, 0x028E, 10, 5, true));
++	AssignDeviceKeys(after);
++
++	int pos = FindDeviceByKey(after, remembered);
++	CHECK_EQ(pos, 1);
++	int from = PrimaryJoyIndex(b);
++	CHECK_EQ(from, 0);
++	CHECK(RetargetJoystick(b, from, after[pos].index) > 0);
++	for (int i = 0; i < NUM_PAD_SLOTS; i++)
++	{
++		if (IsJoy(original.v[i]))
++		{
++			CHECK_EQ(JoyCode(b.v[i]), JoyCode(original.v[i]));    // same buttons ...
++			CHECK_EQ(JoyIndex(b.v[i]), 1);                         // ... on the new id
++		}
++	}
++}
++
++static void test_profile_roundtrip()
++{
++	printf("profile files\n");
++	Profile p;
++	p.name = "Player 1 = Xbox, caf\xC3\xA9";
++	p.deviceKey = "045E:028E#0";
++	p.deviceName = "Controller (XBOX 360 For Windows)";
++	for (int i = 0; i < NUM_SLOTS; i++) p.bindings.v[i] = (Binding)(0x8000 + i * 257 + (i == 3 ? 0x7000 : 0));
++	p.bindings.v[SLOT_UP] = 'W';
++	p.bindings.v[SLOT_DOWN] = 0;
++
++	std::string text = SerializeProfile(p);
++	Profile q;
++	CHECK(ParseProfile(text, q));
++	CHECK(q.name == p.name); CHECK(q.deviceKey == p.deviceKey); CHECK(q.deviceName == p.deviceName);
++	for (int i = 0; i < NUM_SLOTS; i++) CHECK_EQ(q.bindings.v[i], p.bindings.v[i]);
++
++	// the same with LF-only line ends, a BOM, comments, blank lines and different key case
++	std::string lf;
++	for (size_t i = 0; i < text.size(); i++) if (text[i] != '\r') lf += text[i];
++	Profile r;
++	CHECK(ParseProfile("\xEF\xBB\xBF" + lf, r));
++	CHECK(r.bindings.v[SLOT_UP] == 'W');
++
++	Profile s;
++	CHECK(ParseProfile("# hand written\n\nFORMAT = 1\nup = 0x8006\n  Down=  1234  \nbogus=5\nthis line has no equals\nA=0x1FFFF\nB=banana\nX=\n", s));
++	CHECK_EQ(s.bindings.v[SLOT_UP], 0x8006);
++	CHECK_EQ(s.bindings.v[SLOT_DOWN], 1234);
++	CHECK_EQ(s.bindings.v[SLOT_A], 0);                  // out of range -> ignored
++	CHECK_EQ(s.bindings.v[SLOT_B], 0);                  // not a number -> ignored
++	CHECK_EQ(s.bindings.v[SLOT_X], 0);                  // empty -> ignored
++
++	Profile t; t.name = "keep";
++	CHECK(!ParseProfile("Up=0x8006\n", t));             // no Format line
++	CHECK(!ParseProfile("", t));
++	CHECK(!ParseProfile("Format=2\nUp=0x8006\n", t));   // from the future
++	CHECK(!ParseProfile("Format=1x\n", t));
++	CHECK(t.name == "keep");                            // failed parses do not touch the output
++
++	// multi-line values cannot break the file
++	Profile u; u.name = "two\r\nlines"; u.deviceName = "x\ny";
++	Profile v; CHECK(ParseProfile(SerializeProfile(u), v));
++	CHECK(v.name == "two  lines"); CHECK(v.deviceName == "x y");
++}
++
++static void test_sanitize()
++{
++	printf("profile names\n");
++	CHECK(SanitizeProfileName("My Pad") == "My Pad");
++	CHECK(SanitizeProfileName("  padded  ") == "padded");
++	CHECK(SanitizeProfileName("a/b\\c:d*e?f\"g<h>i|j") == "a_b_c_d_e_f_g_h_i_j");
++	CHECK(SanitizeProfileName("..\\..\\evil") == "..__..__evil" || SanitizeProfileName("..\\..\\evil") == ".._.._evil");
++	CHECK(SanitizeProfileName("trailing dots...") == "trailing dots");
++	CHECK(SanitizeProfileName("tab\there\n") == "tabhere");
++	CHECK(SanitizeProfileName("") == "");
++	CHECK(SanitizeProfileName("   ") == "");
++	CHECK(SanitizeProfileName("...") == "");
++	CHECK(SanitizeProfileName("con") == "_con");
++	CHECK(SanitizeProfileName("NUL.txt") == "_NUL.txt");
++	CHECK(SanitizeProfileName("Com3") == "_Com3");
++	CHECK(SanitizeProfileName("lpt9") == "_lpt9");
++	CHECK(SanitizeProfileName("COM0") == "COM0");          // only COM1-9 are reserved
++	CHECK(SanitizeProfileName("console") == "console");
++	CHECK(SanitizeProfileName("caf\xC3\xA9") == "caf\xC3\xA9");
++
++	std::string longName(100, 'x');
++	CHECK_EQ(SanitizeProfileName(longName).size(), (size_t)64);
++	// 63 ASCII bytes + a 2-byte character: cutting at 64 would split it, so it is dropped whole
++	std::string split = std::string(63, 'x') + "\xC3\xA9" + "yyy";
++	CHECK(SanitizeProfileName(split) == std::string(63, 'x'));
++}
++
++#ifdef HAVE_REAL_SJOYPAD
++static void test_sjoypad_mapping()
++{
++	printf("SJoypad <-> Bindings (real struct from wsnes9x.h)\n");
++	SJoypad pad, turbo;
++	memset(&pad, 0, sizeof(pad)); memset(&turbo, 0, sizeof(turbo));
++
++	Bindings in;
++	for (int i = 0; i < NUM_SLOTS; i++) in.v[i] = (Binding)(0x100 + i);   // every slot unique
++	WriteBindings(in, pad, turbo);
++
++	CHECK_EQ(pad.Up, 0x100 + SLOT_UP);           CHECK_EQ(pad.Down, 0x100 + SLOT_DOWN);
++	CHECK_EQ(pad.Left, 0x100 + SLOT_LEFT);       CHECK_EQ(pad.Right, 0x100 + SLOT_RIGHT);
++	CHECK_EQ(pad.Left_Up, 0x100 + SLOT_UPLEFT);  CHECK_EQ(pad.Right_Down, 0x100 + SLOT_DOWNRIGHT);
++	CHECK_EQ(pad.Start, 0x100 + SLOT_START);     CHECK_EQ(pad.Select, 0x100 + SLOT_SELECT);
++	// the turbo panel reuses the direction fields for its four extra inputs
++	CHECK_EQ(turbo.Left,  0x100 + SLOT_AUTOHOLD);
++	CHECK_EQ(turbo.Right, 0x100 + SLOT_CLEARALL);
++	CHECK_EQ(turbo.Up,    0x100 + SLOT_TEMPTURBO);
++	CHECK_EQ(turbo.Down,  0x100 + SLOT_AUTOFIRE);
++	CHECK_EQ(turbo.A,     0x100 + SLOT_TURBO_A);
++
++	Bindings out;
++	ReadBindings(pad, turbo, out);
++	for (int i = 0; i < NUM_SLOTS; i++) CHECK_EQ(out.v[i], in.v[i]);
++
++	// an Enabled flag next to the bindings is not touched by either direction
++	pad.Enabled = 1; turbo.Enabled = 0;
++	WriteBindings(in, pad, turbo);
++	CHECK_EQ(pad.Enabled, 1); CHECK_EQ(turbo.Enabled, 0);
++}
++#endif
++
++int main()
++{
++	test_encoding();
++	test_slot_names();
++	test_primary_and_retarget();
++	test_device_keys();
++	test_autoconfigure_xbox_pov();
++	test_autoconfigure_playstation();
++	test_autoconfigure_edge_cases();
++	test_reorder_scenario();
++	test_profile_roundtrip();
++	test_sanitize();
++#ifdef HAVE_REAL_SJOYPAD
++	test_sjoypad_mapping();
++#else
++	printf("(SJoypad mapping test skipped: build with HAVE_REAL_SJOYPAD, see run_tests.sh)\n");
++#endif
++	printf("\n%d checks, %d failed\n", g_checks, g_failed);
++	return g_failed ? 1 : 0;
++}
+diff --git a/win32/tests/run_tests.sh b/win32/tests/run_tests.sh
+new file mode 100644
+index 0000000..4112f54
+--- /dev/null
++++ b/win32/tests/run_tests.sh
+@@ -0,0 +1,16 @@
++#!/bin/sh
++# Builds and runs the unit tests for the platform-independent controller profile code.
++# Needs a C++ compiler (g++ or clang++). Run from anywhere:  sh win32/tests/run_tests.sh
++set -e
++here="$(cd "$(dirname "$0")" && pwd)"
++out="$(mktemp -d)"
++trap 'rm -rf "$out"' EXIT
++
++# Cut the real SJoypad struct out of wsnes9x.h so the test checks the actual field layout.
++sed -n '/^struct SJoypad {/,/^};/p' "$here/../wsnes9x.h" > "$out/sjoypad_real.h"
++[ -s "$out/sjoypad_real.h" ] || { echo "could not extract struct SJoypad from wsnes9x.h"; exit 1; }
++
++CXX="${CXX:-c++}"
++"$CXX" -std=c++11 -Wall -Wextra -DHAVE_REAL_SJOYPAD -I"$out" \
++    "$here/inputprofiles_core_test.cpp" "$here/../InputProfilesCore.cpp" -o "$out/test"
++"$out/test"
+diff --git a/win32/wconfig.cpp b/win32/wconfig.cpp
+index 838b6b8..29ee8bd 100644
+--- a/win32/wconfig.cpp
++++ b/win32/wconfig.cpp
+@@ -18,6 +18,7 @@
+ #include "../snes9x.h"
+ #include "wsnes9x.h"
+ #include "wlanguage.h"
++#include "InputProfiles.h"
+ #include "../display.h"
+ #include "../conffile.h"
+ #include "../spc7110.h"
+@@ -903,6 +904,9 @@ void WinRegisterConfigItems()
+ #undef ADDT3
+ #undef ADDTN
+ #undef ADD2T2
++#define ADDDEV(n) AddStringC("Joypad" #n ":Device", JoypadDeviceKey[n-1], JOYPAD_DEVICE_KEY_LEN, "", "game controller joypad " #n " was last set up for (filled in by the Input dialog). Lets Snes9x find the controller again if Windows numbers it differently.")
++	ADDDEV(1); ADDDEV(2); ADDDEV(3); ADDDEV(4); ADDDEV(5);
++#undef ADDDEV
+ 	AddBool2C("Input:Background", GUI.BackgroundInput, false, "on to detect game keypresses and hotkeys while window is inactive, if PauseWhenInactive = FALSE.");
+ 	AddBool2C("Input:BackgroundKeyHotkeys", GUI.BackgroundKeyHotkeys, true, "on to also detect keyboard hotkeys when backgroundinput is active");
+ #undef CATEGORY
+diff --git a/win32/win32.cpp b/win32/win32.cpp
+index dbf6935..e1a0447 100644
+--- a/win32/win32.cpp
++++ b/win32/win32.cpp
+@@ -23,6 +23,7 @@
+ #include "render.h"
+ #include "AVIOutput.h"
+ #include "wlanguage.h"
++#include "InputProfiles.h"
+ 
+ #include <shlwapi.h>
+ #include <direct.h>
+@@ -870,6 +871,7 @@ void InitSnes9x( void)
+ 	S9xMovieInit ();
+ 
+     S9xDetectJoypads();
++    InputProfiles_ResolveDevices(); // controllers that Windows now numbers differently keep their joypad
+ }
+ void DeinitS9x()
+ {
+diff --git a/win32/wlanguage.h b/win32/wlanguage.h
+index 8657bda..c874f28 100644
+--- a/win32/wlanguage.h
++++ b/win32/wlanguage.h
+@@ -70,6 +70,32 @@ Nintendo is a trademark.")
+ #define INPUTCONFIG_LABEL_MAKE_HELD TEXT("Autohold")
+ #define INPUTCONFIG_LABEL_MAKE_TURBO_HELD TEXT("Autofire")
+ #define INPUTCONFIG_LABEL_CONTROLLER_TURBO_PANEL_MOD TEXT(" Turbo")
++#define INPUTCONFIG_GROUP_PROFILES TEXT("Device and Profile")
++#define INPUTCONFIG_LABEL_DEVICE TEXT("Device:")
++#define INPUTCONFIG_LABEL_PROFILE TEXT("Profile:")
++#define INPUTCONFIG_BUTTON_REFRESH TEXT("Refresh")
++#define INPUTCONFIG_BUTTON_AUTOCONFIG TEXT("Auto-Configure")
++#define INPUTCONFIG_BUTTON_LOAD TEXT("Load")
++#define INPUTCONFIG_BUTTON_SAVE TEXT("Save")
++#define INPUTCONFIG_BUTTON_DELETE TEXT("Delete")
++#define INPUTCONFIG_DEVICE_KEYBOARD TEXT("Keyboard / as saved")
++#define INPUTCONFIG_DEVICE_ITEM TEXT("%d: %s")
++#define INPUTCONFIG_MSG_DEVICES_FOUND TEXT("%d game controller(s) found.")
++#define INPUTCONFIG_MSG_AUTOCONFIG_DONE TEXT("Joypad #%d set up for %s (%s layout).")
++#define INPUTCONFIG_MSG_AUTOCONFIG_UNUSABLE TEXT("%s doesn't look like a gamepad (it needs a d-pad or stick and at least 2 buttons).")
++#define INPUTCONFIG_MSG_KEYBOARD_RESET TEXT("Joypad #%d set back to its default keyboard keys.")
++#define INPUTCONFIG_MSG_NO_KEYBOARD_DEFAULT TEXT("Joypad #%d has no default keyboard keys. Pick a controller in the Device list.")
++#define INPUTCONFIG_MSG_NEED_NAME TEXT("Type a profile name first.")
++#define INPUTCONFIG_MSG_NO_SUCH_PROFILE TEXT("There is no profile called \"%s\".")
++#define INPUTCONFIG_MSG_BAD_PROFILE TEXT("\"%s\" is not a valid controller profile.")
++#define INPUTCONFIG_MSG_PROFILE_LOADED TEXT("Loaded \"%s\" into Joypad #%d.")
++#define INPUTCONFIG_MSG_PROFILE_LOADED_NO_DEVICE TEXT("Loaded \"%s\" into Joypad #%d. Its controller (%s) isn't connected.")
++#define INPUTCONFIG_MSG_PROFILE_SAVED TEXT("Saved profile \"%s\".")
++#define INPUTCONFIG_MSG_PROFILE_DELETED TEXT("Deleted profile \"%s\".")
++#define INPUTCONFIG_MSG_SAVE_FAILED TEXT("Couldn't save the profile \"%s\".")
++#define INPUTCONFIG_MSG_DELETE_FAILED TEXT("Couldn't delete the profile \"%s\".")
++#define INPUTCONFIG_MSG_CONFIRM_OVERWRITE TEXT("A profile called \"%s\" already exists. Replace it?")
++#define INPUTCONFIG_MSG_CONFIRM_DELETE TEXT("Delete the profile \"%s\"?")
+ 
+ // Hotkeys Dialog Strings
+ #define HOTKEYS_TITLE TEXT("Hotkey Configuration")
+diff --git a/win32/wsnes9x.cpp b/win32/wsnes9x.cpp
+index f451aef..feec556 100644
+--- a/win32/wsnes9x.cpp
++++ b/win32/wsnes9x.cpp
+@@ -48,6 +48,7 @@
+ #include "../statemanager.h"
+ #include "AVIOutput.h"
+ #include "InputCustom.h"
++#include "InputProfiles.h"
+ #include <vector>
+ #include <string>
+ 
+@@ -245,6 +246,12 @@ struct SJoypad Joypad[16] = {
+ 			{ false, 0, 0, 0, 0,  0, 0, 0, 0,  0, 0,  0, 0, 0, 0, 0, 0 },/* Joypad 8 Turbo disabled */
+ };
+ 
++// Untouched copy of the factory table above. Joypad[] has a constant initializer, so it is
++// already filled in when this runs, before any config file is read. The input dialog uses
++// it to put the default keyboard keys back (Auto-Configure with "Keyboard" selected).
++struct SJoypad DefaultJoypad[16];
++static const int s_defaultJoypadCopied = (memcpy(DefaultJoypad, Joypad, sizeof(DefaultJoypad)), 0);
++
+ // stores on/off toggle info for each key of each controller
+ SJoypad ToggleJoypadStorage [8] = {
+ 	{
+@@ -1794,6 +1801,7 @@ LRESULT CALLBACK WinProc(
+ 
+         case ID_INPUT_DETECTGAMEPADCHANGES:
+             S9xDetectJoypads();
++            InputProfiles_ResolveDevices(); // controllers that moved to another number keep their joypad
+             break;
+ 
+ 		case ID_FILE_LOADMULTICART:
+@@ -8056,7 +8064,7 @@ INT_PTR CALLBACK DlgInputConfig(HWND hDlg, UINT msg, WPARAM wParam, LPARAM lPara
+ 	static int index=0;
+ 
+ 
+-	static SJoypad pads[10];
++	static SJoypad pads[16];   // everything the dialog can change, so Cancel puts it all back
+ 
+ 
+ 	//HBRUSH g_hbrBackground;
+@@ -8098,7 +8106,7 @@ switch(msg)
+ 		for(i=5;i<10;i++)
+ 			Joypad[i].Left_Up = Joypad[i].Right_Up = Joypad[i].Left_Down = Joypad[i].Right_Down = 0;
+ 
+-		memcpy(pads, Joypad, 10*sizeof(SJoypad));
++		memcpy(pads, Joypad, sizeof(pads));
+ 
+ 		for( i=0;i<256;i++)
+ 			GetAsyncKeyState(i);
+@@ -8127,6 +8135,8 @@ switch(msg)
+ 
+ 		EnableDisableKeyFields(index,hDlg);
+ 
++		InputProfilesDlg_Init(hDlg, 0, false); // device list, profiles, auto-configure
++
+ 		PostMessage(hDlg,WM_COMMAND, CBN_SELCHANGE<<16, 0);
+ 
+ 		SetFocus(GetDlgItem(hDlg,IDC_JPCOMBO));
+@@ -8219,15 +8229,27 @@ switch(msg)
+ 		PostMessage(hDlg,WM_NEXTDLGCTL,0,0);
+ 		return true;
+ 	case WM_COMMAND:
++		{
++			// device list, controller profiles and auto-configure (InputProfiles.cpp)
++			const int hookResult = InputProfilesDlg_OnCommand(hDlg, LOWORD(wParam), HIWORD(wParam), (index >= 8) ? index - 8 : index);
++			if(hookResult != IPD_NOT_HANDLED)
++			{
++				if(hookResult == IPD_BINDINGS_CHANGED)
++					set_buttoninfo(index, hDlg);
++				return TRUE;
++			}
++		}
+ 		switch(LOWORD(wParam))
+ 		{
+ 		case IDCANCEL:
+-			memcpy(Joypad, pads, 10*sizeof(SJoypad));
++			memcpy(Joypad, pads, sizeof(pads));
+ 			EndDialog(hDlg,0);
+ 			break;
+ 
+ 		case IDOK:
+ 			Settings.UpAndDown = IsDlgButtonChecked(hDlg, IDC_ALLOWLEFTRIGHT);
++			S9xDetectJoypads(); // so a controller plugged in since startup works right away
++			InputProfiles_RememberDevices();
+ 			WinSaveConfigFile();
+ 			EndDialog(hDlg,0);
+ 			break;
+@@ -8261,6 +8283,8 @@ switch(msg)
+ 
+ 				EnableDisableKeyFields(index,hDlg);
+ 
++				InputProfilesDlg_OnSlotChanged(hDlg, (index >= 8) ? index - 8 : index, index >= 8);
++
+ 				break;
+ 		}
+ 		return FALSE;
