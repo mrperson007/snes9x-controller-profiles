@@ -1,101 +1,53 @@
+diff --git a/conffile.cpp b/conffile.cpp
+index 817afae..5e121e2 100644
+--- a/conffile.cpp
++++ b/conffile.cpp
+@@ -452,7 +452,7 @@ void ConfigFile::ClearLines()
+     }
+ }
+ 
+-bool ConfigFile::ConfigEntry::section_then_key_less::operator()(const ConfigEntry &a, const ConfigEntry &b) {
++bool ConfigFile::ConfigEntry::section_then_key_less::operator()(const ConfigEntry &a, const ConfigEntry &b) const {
+ 	if(curConfigFile && a.section!=b.section){
+ 		const int sva = curConfigFile->GetSectionSize(a.section);
+ 		const int svb = curConfigFile->GetSectionSize(b.section);
+diff --git a/conffile.h b/conffile.h
+index ba69812..6b45d70 100644
+--- a/conffile.h
++++ b/conffile.h
+@@ -90,7 +90,7 @@ class ConfigFile {
+ 		mutable bool used;
+ 
+         struct section_then_key_less {
+-            bool operator()(const ConfigEntry &a, const ConfigEntry &b);
++            bool operator()(const ConfigEntry &a, const ConfigEntry &b) const;
+         };
+ 
+         struct key_less {
+@@ -101,7 +101,7 @@ class ConfigFile {
+         };
+ 
+         struct line_less {
+-            bool operator()(const ConfigEntry &a, const ConfigEntry &b){
++            bool operator()(const ConfigEntry &a, const ConfigEntry &b) const{
+ 				if(a.line==b.line) return (b.val.empty() && !a.val.empty()) || a.key<b.key;
+                 if(b.line<0) return true;
+                 if(a.line<0) return false;
 diff --git a/win32/CXAudio2.cpp b/win32/CXAudio2.cpp
-index 4323e5d..f46b826 100644
+index 4323e5d..395e552 100644
 --- a/win32/CXAudio2.cpp
 +++ b/win32/CXAudio2.cpp
-@@ -12,6 +12,92 @@
+@@ -12,6 +12,9 @@
  #include "dxerr.h"
  #include "commctrl.h"
  #include <assert.h>
-+#include <mmdeviceapi.h>
-+#include <propidl.h>
-+#include <propsys.h>
++#include "XAudio2Devices.h"
 +
 +#pragma comment(lib, "xaudio2.lib")
-+
-+/*  Output device enumeration
-+	The XAudio2 that ships with the Windows SDK (2.8 and later) no longer has GetDeviceCount()/GetDeviceDetails(),
-+	and CreateMasteringVoice() takes an endpoint id string instead of an index. The playback devices are therefore
-+	listed with the MMDevice API; the list order is the order of the entries in the "Output device" dropdown
-+	(after "Default").
-+*/
-+namespace
-+{
-+	struct OutputDevice
-+	{
-+		std::wstring id;
-+		std::wstring name;
-+	};
-+
-+	// PKEY_Device_FriendlyName, spelled out so no extra library is needed to resolve it
-+	const PROPERTYKEY S9X_PKEY_Device_FriendlyName =
-+		{ { 0xa45c254e, 0xdf1c, 0x4efd, { 0x80, 0x20, 0x67, 0xd1, 0x46, 0xa8, 0x50, 0xe0 } }, 14 };
-+
-+	std::vector<OutputDevice> EnumerateOutputDevices()
-+	{
-+		std::vector<OutputDevice> result;
-+
-+		HRESULT hrCom = CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);   // same mode as the main thread (win32.cpp)
-+
-+		IMMDeviceEnumerator *enumerator = NULL;
-+		if (SUCCEEDED(CoCreateInstance(__uuidof(MMDeviceEnumerator), NULL, CLSCTX_ALL,
-+			__uuidof(IMMDeviceEnumerator), (void **)&enumerator)) && enumerator)
-+		{
-+			IMMDeviceCollection *devices = NULL;
-+			if (SUCCEEDED(enumerator->EnumAudioEndpoints(eRender, DEVICE_STATE_ACTIVE, &devices)) && devices)
-+			{
-+				UINT count = 0;
-+				devices->GetCount(&count);
-+
-+				for (UINT i = 0; i < count; i++)
-+				{
-+					IMMDevice *device = NULL;
-+					if (FAILED(devices->Item(i, &device)) || !device)
-+						continue;
-+
-+					LPWSTR id = NULL;
-+					if (SUCCEEDED(device->GetId(&id)) && id)
-+					{
-+						OutputDevice entry;
-+						entry.id = id;
-+						CoTaskMemFree(id);
-+
-+						IPropertyStore *props = NULL;
-+						if (SUCCEEDED(device->OpenPropertyStore(STGM_READ, &props)) && props)
-+						{
-+							PROPVARIANT name;
-+							PropVariantInit(&name);
-+							if (SUCCEEDED(props->GetValue(S9X_PKEY_Device_FriendlyName, &name)) &&
-+								name.vt == VT_LPWSTR && name.pwszVal)
-+							{
-+								entry.name = name.pwszVal;
-+							}
-+							PropVariantClear(&name);
-+							props->Release();
-+						}
-+
-+						if (entry.name.empty())
-+							entry.name = entry.id;
-+
-+						result.push_back(entry);
-+					}
-+
-+					device->Release();
-+				}
-+				devices->Release();
-+			}
-+			enumerator->Release();
-+		}
-+
-+		if (SUCCEEDED(hrCom))
-+			CoUninitialize();
-+
-+		return result;
-+	}
-+}
  
  /* CXAudio2
  	Implements audio output through XAudio2.
-@@ -128,11 +214,18 @@ bool CXAudio2::InitVoices(void)
+@@ -128,11 +131,18 @@ bool CXAudio2::InitVoices(void)
  	HRESULT hr;
      // subtract -1, we added "Default" as first index
      int device_index = FindDeviceIndex(GUI.AudioDevice) - 1;
@@ -106,7 +58,7 @@ index 4323e5d..f46b826 100644
 +	std::wstring device_id;
 +	if (device_index >= 0)
 +	{
-+		std::vector<OutputDevice> devices = EnumerateOutputDevices();
++		std::vector<XAudio2OutputDevice> devices = XAudio2_EnumerateOutputDevices();
 +		if ((size_t)device_index < devices.size())
 +			device_id = devices[device_index].id;
 +	}
@@ -117,7 +69,7 @@ index 4323e5d..f46b826 100644
  			DXTRACE_ERR_MSGBOX(TEXT("Unable to create mastering voice."),hr);
  			return false;
  	}
-@@ -374,18 +467,12 @@ std::vector<std::wstring> CXAudio2::GetDeviceList()
+@@ -374,18 +384,12 @@ std::vector<std::wstring> CXAudio2::GetDeviceList()
  
      if (pXAudio2)
      {
@@ -127,7 +79,7 @@ index 4323e5d..f46b826 100644
          device_list.push_back(_T("Default"));
  
 -        for (unsigned int i = 0; i < num_devices; i++)
-+        std::vector<OutputDevice> devices = EnumerateOutputDevices();
++        std::vector<XAudio2OutputDevice> devices = XAudio2_EnumerateOutputDevices();
 +        for (size_t i = 0; i < devices.size(); i++)
          {
 -            XAUDIO2_DEVICE_DETAILS device_details;
@@ -1507,6 +1459,126 @@ index 0000000..319f0cf
 +} // namespace inprof
 +
 +#endif
+diff --git a/win32/XAudio2Devices.cpp b/win32/XAudio2Devices.cpp
+new file mode 100644
+index 0000000..562569e
+--- /dev/null
++++ b/win32/XAudio2Devices.cpp
+@@ -0,0 +1,82 @@
++/*****************************************************************************\
++     Snes9x - Portable Super Nintendo Entertainment System (TM) emulator.
++                This file is licensed under the Snes9x License.
++   For further information, consult the LICENSE file in the root directory.
++\*****************************************************************************/
++
++/*  The XAudio2 that ships with the Windows SDK (2.8 and later) no longer has GetDeviceCount()/GetDeviceDetails(),
++	and CreateMasteringVoice() takes an endpoint id string instead of an index. The playback devices are
++	therefore listed with the MMDevice API.
++*/
++
++#include <windows.h>
++#include <objbase.h>
++#include <mmdeviceapi.h>
++#include <propidl.h>
++#include "XAudio2Devices.h"
++
++// PKEY_Device_FriendlyName, spelled out so no extra library is needed to resolve it
++const PROPERTYKEY S9X_PKEY_Device_FriendlyName =
++	{ { 0xa45c254e, 0xdf1c, 0x4efd, { 0x80, 0x20, 0x67, 0xd1, 0x46, 0xa8, 0x50, 0xe0 } }, 14 };
++
++std::vector<XAudio2OutputDevice> XAudio2_EnumerateOutputDevices()
++{
++	std::vector<XAudio2OutputDevice> result;
++
++	HRESULT hrCom = CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);   // same mode as the main thread (win32.cpp)
++
++	IMMDeviceEnumerator *enumerator = NULL;
++	if (SUCCEEDED(CoCreateInstance(__uuidof(MMDeviceEnumerator), NULL, CLSCTX_ALL,
++		__uuidof(IMMDeviceEnumerator), (void **)&enumerator)) && enumerator)
++	{
++		IMMDeviceCollection *devices = NULL;
++		if (SUCCEEDED(enumerator->EnumAudioEndpoints(eRender, DEVICE_STATE_ACTIVE, &devices)) && devices)
++		{
++			UINT count = 0;
++			devices->GetCount(&count);
++
++			for (UINT i = 0; i < count; i++)
++			{
++				IMMDevice *device = NULL;
++				if (FAILED(devices->Item(i, &device)) || !device)
++					continue;
++
++				LPWSTR id = NULL;
++				if (SUCCEEDED(device->GetId(&id)) && id)
++				{
++					XAudio2OutputDevice entry;
++					entry.id = id;
++					CoTaskMemFree(id);
++
++					IPropertyStore *props = NULL;
++					if (SUCCEEDED(device->OpenPropertyStore(STGM_READ, &props)) && props)
++					{
++						PROPVARIANT name;
++						PropVariantInit(&name);
++						if (SUCCEEDED(props->GetValue(S9X_PKEY_Device_FriendlyName, &name)) &&
++							name.vt == VT_LPWSTR && name.pwszVal)
++						{
++							entry.name = name.pwszVal;
++						}
++						PropVariantClear(&name);
++						props->Release();
++					}
++
++					if (entry.name.empty())
++						entry.name = entry.id;
++
++					result.push_back(entry);
++				}
++
++				device->Release();
++			}
++			devices->Release();
++		}
++		enumerator->Release();
++	}
++
++	if (SUCCEEDED(hrCom))
++		CoUninitialize();
++
++	return result;
++}
+diff --git a/win32/XAudio2Devices.h b/win32/XAudio2Devices.h
+new file mode 100644
+index 0000000..451af1c
+--- /dev/null
++++ b/win32/XAudio2Devices.h
+@@ -0,0 +1,26 @@
++/*****************************************************************************\
++     Snes9x - Portable Super Nintendo Entertainment System (TM) emulator.
++                This file is licensed under the Snes9x License.
++   For further information, consult the LICENSE file in the root directory.
++\*****************************************************************************/
++
++// Lists the audio playback devices for the XAudio2 output (see CXAudio2.cpp).
++// Kept in its own file, with no Snes9x headers, so that the Windows audio device headers
++// are compiled on their own.
++
++#ifndef S9X_XAUDIO2DEVICES_H_INCLUDED
++#define S9X_XAUDIO2DEVICES_H_INCLUDED
++
++#include <string>
++#include <vector>
++
++struct XAudio2OutputDevice
++{
++	std::wstring id;     // endpoint id, what CreateMasteringVoice() wants
++	std::wstring name;   // display name, what the "Output device" dropdown shows
++};
++
++// Active playback devices, in the order Windows lists them.
++std::vector<XAudio2OutputDevice> XAudio2_EnumerateOutputDevices();
++
++#endif
 diff --git a/win32/_tfwopen.h b/win32/_tfwopen.h
 index 3a519a2..758ea56 100644
 --- a/win32/_tfwopen.h
@@ -1634,32 +1706,34 @@ index 775004a..d74cb5b 100644
      END
  
 diff --git a/win32/snes9xw.vcxproj b/win32/snes9xw.vcxproj
-index a9c54df..8615203 100644
+index a9c54df..ffce757 100644
 --- a/win32/snes9xw.vcxproj
 +++ b/win32/snes9xw.vcxproj
-@@ -445,6 +445,8 @@
+@@ -445,6 +445,9 @@
      <ClInclude Include="gl_core_3_1.h" />
      <ClInclude Include="image_functions.h" />
      <ClInclude Include="InputCustom.h" />
 +    <ClInclude Include="InputProfiles.h" />
 +    <ClInclude Include="InputProfilesCore.h" />
++    <ClInclude Include="XAudio2Devices.h" />
      <ClInclude Include="IS9xDisplayOutput.h" />
      <ClInclude Include="IS9xSoundOutput.h" />
      <ClInclude Include="render.h" />
-@@ -587,6 +589,8 @@
+@@ -587,6 +590,9 @@
      <ClCompile Include="gl_core_3_1.c" />
      <ClCompile Include="image_functions.cpp" />
      <ClCompile Include="InputCustom.cpp" />
 +    <ClCompile Include="InputProfiles.cpp" />
 +    <ClCompile Include="InputProfilesCore.cpp" />
++    <ClCompile Include="XAudio2Devices.cpp" />
      <ClCompile Include="render.cpp" />
      <ClCompile Include="wconfig.cpp" />
      <ClCompile Include="win32.cpp" />
 diff --git a/win32/snes9xw.vcxproj.filters b/win32/snes9xw.vcxproj.filters
-index 858ebe5..0a91e00 100644
+index 858ebe5..a2b5c93 100644
 --- a/win32/snes9xw.vcxproj.filters
 +++ b/win32/snes9xw.vcxproj.filters
-@@ -81,6 +81,12 @@
+@@ -81,6 +81,15 @@
      <ClInclude Include="InputCustom.h">
        <Filter>GUI</Filter>
      </ClInclude>
@@ -1669,10 +1743,13 @@ index 858ebe5..0a91e00 100644
 +    <ClInclude Include="InputProfilesCore.h">
 +      <Filter>GUI</Filter>
 +    </ClInclude>
++    <ClInclude Include="XAudio2Devices.h">
++      <Filter>GUI\SoundDriver</Filter>
++    </ClInclude>
      <ClInclude Include="render.h">
        <Filter>GUI</Filter>
      </ClInclude>
-@@ -470,6 +476,12 @@
+@@ -470,6 +479,15 @@
      <ClCompile Include="InputCustom.cpp">
        <Filter>GUI</Filter>
      </ClCompile>
@@ -1681,6 +1758,9 @@ index 858ebe5..0a91e00 100644
 +    </ClCompile>
 +    <ClCompile Include="InputProfilesCore.cpp">
 +      <Filter>GUI</Filter>
++    </ClCompile>
++    <ClCompile Include="XAudio2Devices.cpp">
++      <Filter>GUI\SoundDriver</Filter>
 +    </ClCompile>
      <ClCompile Include="render.cpp">
        <Filter>GUI</Filter>
