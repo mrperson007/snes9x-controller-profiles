@@ -2,6 +2,11 @@
 # Run it from the repository's "Actions" tab (Build Snes9x -> Run workflow), then download
 # the "snes9x-x64" artifact from the finished run. Nothing needs to be installed locally.
 #
+# Run 1 showed the build only needs two small changes to Snes9x's own Windows code (both are in the patch):
+# the audio output device list is rewritten for the XAudio2 that ships with Windows 10 (the original needs the
+# 2010 DirectX SDK, which GitHub's build machines do not have), and a file-stream wrapper header is fixed for
+# the newer C++ library. If the build still fails, the "Summarize build errors" step lists what is left.
+#
 # NOTE: written without being able to run it. The project file asks for the old v141_xp toolset;
 # this overrides it with the one the GitHub runner has (v143). If the build step fails, the log
 # says which line of Snes9x did not compile with the newer compiler.
@@ -31,15 +36,42 @@ jobs:
 
       - name: Apply the controller profile patch
         shell: bash
-        working-directory: snes9x
-        run: git apply --whitespace=nowarn ../patch/controller-profiles.patch
+        run: |
+          # Look for the patch wherever it ended up in this repository (it may have been
+          # uploaded inside a folder), and list what is there if it is missing.
+          PATCH=$(find patch -name controller-profiles.patch -not -path 'patch/.git/*' | head -n 1)
+          if [ -z "$PATCH" ]; then
+            echo "::error::controller-profiles.patch is not in this repository. Files that are:"
+            find patch -type f -not -path 'patch/.git/*'
+            exit 1
+          fi
+          echo "Using $PATCH"
+          cd snes9x
+          git apply --whitespace=nowarn "../$PATCH"
 
       - name: Set up MSBuild
         uses: microsoft/setup-msbuild@v2
 
       - name: Build (Release Unicode, x64)
         working-directory: snes9x
-        run: msbuild win32\snes9xw.sln /t:build /m /p:Configuration="Release Unicode" /p:Platform=x64 /p:PlatformToolset=v143 /p:WindowsTargetPlatformVersion=10.0
+        run: msbuild win32\snes9xw.sln /t:build /m /nologo '/flp1:logfile=build-errors.log;errorsonly' /p:Configuration="Release Unicode" /p:Platform=x64 /p:PlatformToolset=v143 /p:WindowsTargetPlatformVersion=10.0
+
+      # If the build failed: list each distinct compiler/linker error once, on the run's summary page.
+      - name: Summarize build errors
+        if: failure()
+        shell: pwsh
+        working-directory: snes9x
+        run: |
+          if (Test-Path build-errors.log) {
+            $lines = Get-Content build-errors.log |
+              ForEach-Object { ($_ -replace '^\s+', '') -replace '\s*\[[A-Za-z]:\\[^\]]*\]\s*$', '' -replace '^[A-Za-z]:\\a\\[^\\]+\\[^\\]+\\snes9x\\', '' } |
+              Sort-Object -Unique
+            $report = @("Distinct build errors: $($lines.Count)", '') + $lines
+            $report | ForEach-Object { Write-Host $_ }
+            ('```' + "`n" + ($report -join "`n") + "`n" + '```') | Out-File -Append -Encoding utf8 $env:GITHUB_STEP_SUMMARY
+          } else {
+            Write-Host 'build-errors.log was not produced (the failure happened before the build).'
+          }
 
       - name: Upload the executable
         uses: actions/upload-artifact@v4

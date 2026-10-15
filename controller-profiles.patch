@@ -1,3 +1,144 @@
+diff --git a/win32/CXAudio2.cpp b/win32/CXAudio2.cpp
+index 4323e5d..f46b826 100644
+--- a/win32/CXAudio2.cpp
++++ b/win32/CXAudio2.cpp
+@@ -12,6 +12,92 @@
+ #include "dxerr.h"
+ #include "commctrl.h"
+ #include <assert.h>
++#include <mmdeviceapi.h>
++#include <propidl.h>
++#include <propsys.h>
++
++#pragma comment(lib, "xaudio2.lib")
++
++/*  Output device enumeration
++	The XAudio2 that ships with the Windows SDK (2.8 and later) no longer has GetDeviceCount()/GetDeviceDetails(),
++	and CreateMasteringVoice() takes an endpoint id string instead of an index. The playback devices are therefore
++	listed with the MMDevice API; the list order is the order of the entries in the "Output device" dropdown
++	(after "Default").
++*/
++namespace
++{
++	struct OutputDevice
++	{
++		std::wstring id;
++		std::wstring name;
++	};
++
++	// PKEY_Device_FriendlyName, spelled out so no extra library is needed to resolve it
++	const PROPERTYKEY S9X_PKEY_Device_FriendlyName =
++		{ { 0xa45c254e, 0xdf1c, 0x4efd, { 0x80, 0x20, 0x67, 0xd1, 0x46, 0xa8, 0x50, 0xe0 } }, 14 };
++
++	std::vector<OutputDevice> EnumerateOutputDevices()
++	{
++		std::vector<OutputDevice> result;
++
++		HRESULT hrCom = CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);   // same mode as the main thread (win32.cpp)
++
++		IMMDeviceEnumerator *enumerator = NULL;
++		if (SUCCEEDED(CoCreateInstance(__uuidof(MMDeviceEnumerator), NULL, CLSCTX_ALL,
++			__uuidof(IMMDeviceEnumerator), (void **)&enumerator)) && enumerator)
++		{
++			IMMDeviceCollection *devices = NULL;
++			if (SUCCEEDED(enumerator->EnumAudioEndpoints(eRender, DEVICE_STATE_ACTIVE, &devices)) && devices)
++			{
++				UINT count = 0;
++				devices->GetCount(&count);
++
++				for (UINT i = 0; i < count; i++)
++				{
++					IMMDevice *device = NULL;
++					if (FAILED(devices->Item(i, &device)) || !device)
++						continue;
++
++					LPWSTR id = NULL;
++					if (SUCCEEDED(device->GetId(&id)) && id)
++					{
++						OutputDevice entry;
++						entry.id = id;
++						CoTaskMemFree(id);
++
++						IPropertyStore *props = NULL;
++						if (SUCCEEDED(device->OpenPropertyStore(STGM_READ, &props)) && props)
++						{
++							PROPVARIANT name;
++							PropVariantInit(&name);
++							if (SUCCEEDED(props->GetValue(S9X_PKEY_Device_FriendlyName, &name)) &&
++								name.vt == VT_LPWSTR && name.pwszVal)
++							{
++								entry.name = name.pwszVal;
++							}
++							PropVariantClear(&name);
++							props->Release();
++						}
++
++						if (entry.name.empty())
++							entry.name = entry.id;
++
++						result.push_back(entry);
++					}
++
++					device->Release();
++				}
++				devices->Release();
++			}
++			enumerator->Release();
++		}
++
++		if (SUCCEEDED(hrCom))
++			CoUninitialize();
++
++		return result;
++	}
++}
+ 
+ /* CXAudio2
+ 	Implements audio output through XAudio2.
+@@ -128,11 +214,18 @@ bool CXAudio2::InitVoices(void)
+ 	HRESULT hr;
+     // subtract -1, we added "Default" as first index
+     int device_index = FindDeviceIndex(GUI.AudioDevice) - 1;
+-    if (device_index < 0)
+-        device_index = 0;
++
++	// NULL selects the default playback device
++	std::wstring device_id;
++	if (device_index >= 0)
++	{
++		std::vector<OutputDevice> devices = EnumerateOutputDevices();
++		if ((size_t)device_index < devices.size())
++			device_id = devices[device_index].id;
++	}
+ 
+ 	if ( FAILED(hr = pXAudio2->CreateMasteringVoice( &pMasterVoice, 2,
+-		Settings.SoundPlaybackRate, 0, device_index, NULL ) ) ) {
++		Settings.SoundPlaybackRate, 0, device_id.empty() ? NULL : device_id.c_str(), NULL ) ) ) {
+ 			DXTRACE_ERR_MSGBOX(TEXT("Unable to create mastering voice."),hr);
+ 			return false;
+ 	}
+@@ -374,18 +467,12 @@ std::vector<std::wstring> CXAudio2::GetDeviceList()
+ 
+     if (pXAudio2)
+     {
+-        UINT32 num_devices;
+-        pXAudio2->GetDeviceCount(&num_devices);
+-
+         device_list.push_back(_T("Default"));
+ 
+-        for (unsigned int i = 0; i < num_devices; i++)
++        std::vector<OutputDevice> devices = EnumerateOutputDevices();
++        for (size_t i = 0; i < devices.size(); i++)
+         {
+-            XAUDIO2_DEVICE_DETAILS device_details;
+-            if (SUCCEEDED(pXAudio2->GetDeviceDetails(i, &device_details)))
+-            {
+-                device_list.push_back(device_details.DisplayName);
+-            }
++            device_list.push_back(devices[i].name);
+         }
+     }
+ 
 diff --git a/win32/InputProfiles.cpp b/win32/InputProfiles.cpp
 new file mode 100644
 index 0000000..e86c306
@@ -1366,6 +1507,50 @@ index 0000000..319f0cf
 +} // namespace inprof
 +
 +#endif
+diff --git a/win32/_tfwopen.h b/win32/_tfwopen.h
+index 3a519a2..758ea56 100644
+--- a/win32/_tfwopen.h
++++ b/win32/_tfwopen.h
+@@ -74,12 +74,12 @@ namespace std {
+ class u8nifstream: public std::ifstream
+ {
+ public:
+-	void __CLR_OR_THIS_CALL open(const char *_Filename, ios_base::open_mode _Mode)
++	void __CLR_OR_THIS_CALL open(const char *_Filename, ios_base::openmode _Mode)
+ 		{
+ 			std::ifstream::open(Utf8ToWide(_Filename), (ios_base::openmode)_Mode);
+ 		}
+ 
+-	void __CLR_OR_THIS_CALL open(const wchar_t *_Filename, ios_base::open_mode _Mode)
++	void __CLR_OR_THIS_CALL open(const wchar_t *_Filename, ios_base::openmode _Mode)
+ 		{
+ 			std::ifstream::open(_Filename, (ios_base::openmode)_Mode);
+ 		}
+@@ -89,19 +89,19 @@ public:
+ 
+ 	explicit __CLR_OR_THIS_CALL u8nifstream(const char *_Filename,
+ 		ios_base::openmode _Mode = ios_base::in,
+-		int _Prot = (int)ios_base::_Openprot)
++		int /*_Prot*/ = 0x40)
+ 		: std::ifstream(Utf8ToWide(_Filename),_Mode) {}
+ 
+ 	explicit __CLR_OR_THIS_CALL u8nifstream(const wchar_t *_Filename,
+ 		ios_base::openmode _Mode = ios_base::in,
+-		int _Prot = (int)ios_base::_Openprot)
+-		: std::ifstream(_Filename,_Mode,_Prot) {}
++		int /*_Prot*/ = 0x40)
++		: std::ifstream(_Filename,_Mode) {}
+ 
+  #ifdef _NATIVE_WCHAR_T_DEFINED
+ 	explicit __CLR_OR_THIS_CALL u8nifstream(const unsigned short *_Filename,
+ 		ios_base::openmode _Mode = ios_base::in,
+-		int _Prot = (int)ios_base::_Openprot)
+-		: std::ifstream(_Filename,_Mode,_Prot) {}
++		int /*_Prot*/ = 0x40)
++		: std::ifstream((const wchar_t *)_Filename,_Mode) {}
+  #endif /* _NATIVE_WCHAR_T_DEFINED */
+ 
+ 	explicit __CLR_OR_THIS_CALL u8nifstream(FILE *_File)
 diff --git a/win32/rsrc/resource.h b/win32/rsrc/resource.h
 index b9ddb6d..dfc26ac 100644
 --- a/win32/rsrc/resource.h
